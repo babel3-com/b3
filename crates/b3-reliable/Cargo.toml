@@ -1,0 +1,22 @@
+[package]
+name = "b3-reliable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mosh-like reliability layer — ordered delivery with checksums over any transport"
+
+[dependencies]
+crc32fast = "1.4"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+tracing = "0.1"
+
+# E2E encryption (EncryptedChannel)
+x25519-dalek = { workspace = true }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+zeroize = "1"

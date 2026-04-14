@@ -1,0 +1,99 @@
+[package]
+name = "b3-cli"
+version.workspace = true
+edition.workspace = true
+description = "Babel3 CLI — voice interface + mesh network for Claude Code"
+
+[lints]
+workspace = true
+
+[features]
+default = ["billing"]
+billing = []
+# EXPERIMENTAL: WebRTC support is not actively maintained and may not work.
+webrtc-experimental = ["dep:b3-webrtc"]
+
+[[bin]]
+name = "b3"
+path = "src/main.rs"
+
+[dependencies]
+b3-common = { path = "../b3-common" }
+b3-reliable = { path = "../b3-reliable" }
+b3-tunnel = { path = "../b3-tunnel" }
+# EXPERIMENTAL: WebRTC support is not actively maintained and may not work.
+b3-webrtc = { path = "../b3-webrtc", optional = true }
+
+# PTY management
+portable-pty = "0.8"
+
+# WireGuard mesh
+boringtun = "0.7"
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
+
+# Networking
+reqwest = { workspace = true }
+tokio = { workspace = true }
+eventsource-stream = "0.2"
+futures-util = "0.3"
+
+# Embedded web server (point-to-point dashboard)
+axum = { version = "0.7", features = ["ws", "multipart"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+# Terminal
+crossterm = "0.28"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Config/serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+dirs = "5"
+
+# Crypto
+base64 = { workspace = true }
+x25519-dalek = { workspace = true }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+
+# System
+gethostname = "0.4"
+
+# Archive (cloudflared macOS .tgz extraction)
+flate2 = "1"
+tar = "0.4"
+
+# Misc
+rand = "0.8"
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ureq = "2"
+
+# Error handling
+thiserror = "1"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Unix-only: process signaling for daemon lifecycle
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Windows-only: process management for daemon lifecycle
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security",
+] }

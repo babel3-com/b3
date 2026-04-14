@@ -1,0 +1,11 @@
+.env
+.hf_token
+.git
+voices/
+default-voices/
+*.wav
+*.pt
+*.npy
+__pycache__
+*.pyc
+README.md

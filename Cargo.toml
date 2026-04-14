@@ -1,0 +1,30 @@
+[workspace]
+members = ["crates/b3-cli", "crates/b3-common", "crates/b3-gpu-relay", "crates/b3-tunnel", "crates/b3-webrtc", "crates/b3-reliable"]
+resolver = "2"
+
+[workspace.package]
+version = "0.3.287"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/babel3-com/b3"
+
+[workspace.dependencies]
+# Shared across crates
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
+
+[workspace.lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+lto = true
+strip = "symbols"
+opt-level = "z"

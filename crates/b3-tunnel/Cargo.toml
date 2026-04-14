@@ -1,0 +1,15 @@
+[package]
+name = "b3-tunnel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reverse tunnel client — per-session isolated pipes for GPU relay and daemon proxy"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+futures-util = "0.3"
+serde_json = { workspace = true }
+tracing = "0.1"
+anyhow = "1"

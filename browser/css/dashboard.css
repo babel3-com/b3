@@ -1,0 +1,1269 @@
+/* dashboard.css — Babel3 agent dashboard styles (open-source)
+ *
+ * Layout: header, terminal (xterm.js), voice bar, LED canvas, file browser,
+ * fullscreen mode with configurable button stack, mobile keyboard handling.
+ *
+ * https://github.com/babel3-ai/babel3
+ */
+
+:root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --accent-glow: rgba(88, 166, 255, 0.3);
+    --green: #3fb950;
+    --red: #f85149;
+    --yellow: #d29922;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* iOS PWA: extend web view into safe areas (status bar + home indicator).
+   min-height trick makes iOS expand the viewport to full screen height.
+   padding-top pushes content below the iOS status bar.
+   body height subtracts the top inset so nothing overflows at the bottom. */
+html {
+    min-height: calc(100% + env(safe-area-inset-top));
+    padding-top: env(safe-area-inset-top);
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    height: calc(100dvh - env(safe-area-inset-top));
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    -webkit-text-size-adjust: 100%;
+}
+
+.header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0.5rem 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+}
+
+.agent-info { display: flex; align-items: center; gap: 0.5rem; }
+
+.credit-display {
+    display: flex; flex-direction: column; gap: 0.5rem;
+    font-size: 0.85rem; color: var(--text-dim);
+}
+#credit-balance { font-weight: 600; color: var(--text); }
+#credit-balance.low { color: #f0883e; }
+#credit-balance.depleted { color: var(--red); }
+.add-credits-btn {
+    width: 24px; height: 24px; border-radius: 50%;
+    border: 1px solid var(--accent); background: transparent;
+    color: var(--accent); font-size: 0.9rem; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+}
+.add-credits-btn:hover { background: rgba(88, 166, 255, 0.1); }
+
+/* Auto-refill toggle — custom switch + budget chips */
+.autorefill-card {
+    margin-top: 2px;
+    padding: 10px 12px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 10px;
+}
+.autorefill-header {
+    display: flex; align-items: center; justify-content: space-between;
+}
+.autorefill-label {
+    font-size: 0.72rem; color: rgba(255,255,255,0.5);
+    display: flex; align-items: center; gap: 5px;
+}
+.autorefill-label svg { opacity: 0.4; }
+/* Custom toggle switch */
+.toggle-switch {
+    position: relative; width: 36px; height: 20px;
+    background: rgba(255,255,255,0.1);
+    border-radius: 10px; cursor: pointer;
+    transition: background 0.25s ease;
+    flex-shrink: 0;
+}
+.toggle-switch.on { background: rgba(63,185,80,0.5); }
+.toggle-switch::after {
+    content: ''; position: absolute;
+    top: 2px; left: 2px;
+    width: 16px; height: 16px;
+    background: rgba(255,255,255,0.7);
+    border-radius: 50%;
+    transition: transform 0.2s ease, background 0.2s ease;
+}
+.toggle-switch.on::after {
+    transform: translateX(16px);
+    background: #fff;
+}
+/* Budget chips */
+.budget-chips {
+    display: flex; gap: 4px; flex-wrap: wrap;
+    margin-top: 8px;
+    opacity: 0; height: 0; overflow: hidden;
+    transition: opacity 0.2s ease, height 0.2s ease, margin 0.2s ease;
+}
+.budget-chips.visible {
+    opacity: 1; height: auto; overflow: visible;
+}
+.budget-chip {
+    padding: 3px 10px;
+    font-size: 0.65rem; font-weight: 500;
+    border-radius: 12px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: transparent;
+    color: rgba(255,255,255,0.4);
+    transition: all 0.15s ease;
+    -webkit-tap-highlight-color: transparent;
+}
+.budget-chip:hover { border-color: rgba(255,255,255,0.2); color: rgba(255,255,255,0.6); }
+.budget-chip.selected {
+    border-color: rgba(63,185,80,0.4);
+    background: rgba(63,185,80,0.1);
+    color: rgba(63,185,80,0.9);
+}
+.budget-sublabel {
+    font-size: 0.6rem; color: rgba(255,255,255,0.2);
+    margin-top: 4px;
+}
+
+.status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--text-dim);
+}
+.status-dot.online { background: var(--green); }
+.status-dot.connecting { background: var(--yellow); animation: pulse 1.5s infinite; }
+.status-dot.offline { background: var(--red); }
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+.agent-name { font-weight: 600; font-size: 0.95rem; }
+.agent-email { color: var(--text-dim); font-size: 0.75rem; }
+
+/* Content area — terminal fills the space */
+.content {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+/* LED container wraps terminal + canvas */
+#led-container { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+#led-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; border-radius: 8px; }
+
+#terminal-container {
+    position: relative;
+    z-index: 1;
+    margin: 8px;
+    flex: 1;
+    min-height: 0;
+    background: #0d0d0d;
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+#xterm-wrap { flex: 1; min-height: 0; padding: 4px; overflow: hidden; }
+/* Disable native touch scroll on xterm viewport — we handle it via JS with momentum */
+.xterm-viewport { touch-action: none !important; -webkit-overflow-scrolling: auto !important; overflow-y: scroll !important; }
+/* Thin overlay scrollbar — auto-hides when not scrolling, doesn't eat layout space */
+.xterm-viewport::-webkit-scrollbar { width: 4px; }
+.xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+.xterm-viewport::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.25); border-radius: 2px; }
+.xterm-viewport::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.45); }
+.xterm-viewport { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.25) transparent; }
+/* Fix xterm.js mobile scroll bug (issue #3613): span elements in the DOM renderer
+   capture touch events, causing scroll to stop after one row when finger lands on text.
+   pointer-events: none lets touch events fall through to the scrollable parent.
+   Text selection is handled by the .xterm-selection overlay layer, not these spans. */
+.xterm-rows span { pointer-events: none !important; }
+
+/* Terminal key strip — left-aligned, dark background */
+.term-keys {
+    display: flex;
+    gap: 4px;
+    padding: 4px 6px;
+    background: #1a1a2e;
+    border-top: 1px solid #333;
+    flex-shrink: 0;
+    justify-content: flex-start;
+}
+.term-key {
+    background: transparent;
+    color: #8b949e;
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-family: monospace;
+    cursor: pointer;
+    min-width: 32px;
+    -webkit-tap-highlight-color: transparent;
+    display: flex; align-items: center; justify-content: center;
+}
+.term-key:active { background: #333; color: #fff; }
+.term-key-enter { min-width: 56px; padding: 6px 14px; }
+
+/* Copy/Paste popup — appears on long-press or after selection */
+.copy-popup {
+    position: fixed; z-index: 10000;
+    background: #2d2d3d; border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 8px; padding: 4px 0; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    display: none; min-width: 80px;
+}
+.copy-popup button {
+    display: block; width: 100%; background: none; border: none;
+    color: #fff; padding: 8px 16px; font-size: 14px; cursor: pointer;
+    text-align: left; white-space: nowrap;
+}
+.copy-popup button:active {
+    background: rgba(88,166,255,0.25);
+}
+.copy-popup button:disabled {
+    color: rgba(255,255,255,0.25); pointer-events: none;
+}
+
+/* Selection drag handles */
+.sel-handle {
+    position: fixed; z-index: 9999;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: var(--accent); border: 2px solid #fff;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+    touch-action: none; display: none;
+    transform: translate(-50%, 0);
+}
+
+/* Click-to-cursor: visual feedback flash */
+.cursor-jump-indicator {
+    position: fixed;
+    pointer-events: none;
+    z-index: 9998;
+    background: rgba(88, 166, 255, 0.5);
+    border-radius: 2px;
+    animation: cursor-jump-flash 0.3s ease-out forwards;
+}
+@keyframes cursor-jump-flash {
+    0% { opacity: 1; transform: scale(1.3); }
+    100% { opacity: 0; transform: scale(1); }
+}
+
+/* ── Keyboard-shrink mode: terminal fills the space above the virtual keyboard ── */
+/* Two modes: terminal-keyboard (tapped terminal) hides voice bar for max space.
+   terminal-keyboard-text (tapped text input) keeps voice bar visible. */
+body.terminal-keyboard,
+body.terminal-keyboard-text {
+    overflow: hidden;
+    /* height is set dynamically via JS to window.visualViewport.height */
+}
+body.terminal-keyboard #terminal-container,
+body.terminal-keyboard-text #terminal-container {
+    /* Let terminal expand to fill all available space above keyboard */
+    flex: 1;
+    min-height: 0;
+}
+body.terminal-keyboard .voice-bar,
+body.terminal-keyboard .header,
+body.terminal-keyboard-text .header {
+    /* Collapse non-terminal chrome when keyboard is open.
+       text mode keeps voice bar visible for text input. */
+    display: none !important;
+}
+body.terminal-keyboard .content,
+body.terminal-keyboard-text .content {
+    /* Content area fills all remaining space */
+    flex: 1;
+    min-height: 0;
+}
+
+/* Voice bar — fixed at bottom */
+.voice-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--surface);
+    border-radius: 25px;
+    margin: 0.4rem 0.5rem;
+    flex-shrink: 0;
+}
+
+.voice-bar textarea {
+    flex: 1;
+    background: transparent;
+    border: none;
+    padding: 0.5rem 0.75rem;
+    color: var(--text);
+    font-size: 1.1rem;
+    font-family: inherit;
+    outline: none;
+    resize: none;
+    overflow: hidden;
+    min-height: 1.4em;
+    max-height: 6em;
+    line-height: 1.4;
+    rows: 1;
+}
+.voice-bar textarea:focus { outline: none; }
+.voice-bar textarea::placeholder { color: var(--text-dim); }
+
+.bar-btn {
+    width: 36px; height: 36px;
+    border-radius: 50%;
+    border: none;
+    background: #3a3a5e;
+    color: #fff;
+    font-size: 1rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    opacity: 0.6;
+    transition: opacity 0.2s;
+}
+.bar-btn:hover { opacity: 0.85; }
+.bar-btn:active { opacity: 1; }
+.bar-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+.mic-btn {
+    width: 40px; height: 40px;
+    border-radius: 50%;
+    position: relative; z-index: 20; /* above terminal-status text */
+    border: none;
+    background: #3a3a5e;
+    color: #fff;
+    font-size: 1.2rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    flex-shrink: 0;
+}
+.mic-btn:hover { opacity: 0.85; }
+.mic-btn.recording {
+    background: var(--green);
+    color: #fff;
+}
+.mic-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.terminal-status {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0;
+}
+.volume-control {
+    position: relative;
+    margin-left: auto; padding-left: 8px;
+}
+.volume-control .vol-icon {
+    font-size: 11px; cursor: pointer; color: rgba(255,255,255,0.4);
+    user-select: none; -webkit-user-select: none;
+    touch-action: manipulation;
+}
+.vol-popup {
+    display: none; position: absolute; bottom: 100%; right: 0;
+    margin-bottom: 8px; padding: 10px 14px;
+    background: rgba(30,30,30,0.95); border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.15);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    z-index: 1000; touch-action: none;
+    flex-direction: column; align-items: center; gap: 6px;
+    min-width: 44px;
+}
+.vol-popup.open { display: flex; }
+.vol-track {
+    width: 28px; height: 70px; background: transparent;
+    border-radius: 2px; position: relative; cursor: pointer;
+    touch-action: none;
+}
+.vol-track::before {
+    content: ''; position: absolute; left: 50%; top: 0;
+    width: 4px; height: 100%; background: rgba(255,255,255,0.2);
+    border-radius: 2px; transform: translateX(-50%);
+}
+.vol-track-fill {
+    position: absolute; bottom: 0; left: 50%; width: 4px;
+    background: rgba(255,255,255,0.5); border-radius: 2px;
+    transform: translateX(-50%);
+}
+.vol-thumb {
+    position: absolute; left: 50%; width: 22px; height: 22px;
+    background: rgba(255,255,255,0.7); border-radius: 50%;
+    transform: translate(-50%, 50%); cursor: pointer;
+    touch-action: none; will-change: transform;
+}
+.vol-popup .vol-pct {
+    font-size: 10px; color: rgba(255,255,255,0.5);
+    min-width: 28px; text-align: center;
+}
+
+
+
+/* Voice level fill (unused now, kept for mic-level-strip) */
+/* Full-width mic level strip below voice bar */
+.mic-level-strip {
+    height: 0; overflow: hidden;
+    transition: height 0.15s ease;
+    margin: 0 15px;
+    border-radius: 0 0 12px 12px;
+    background: var(--bg);
+}
+.mic-level-strip.active { height: 4px; }
+#mic-level-fill {
+    height: 100%; width: 0%;
+    border-radius: 0;
+    transition: width 0.05s linear;
+    background: var(--accent);
+}
+.mic-level-strip.speaking #mic-level-fill { background: var(--red); }
+.mic-level-strip.silence #mic-level-fill { background: var(--yellow); }
+.mic-level-strip.playback #mic-level-fill { background: var(--accent); transition: width 0.05s linear; }
+
+/* Mini player (disabled — status bar shows progress instead) */
+.mini-player { display: none !important; }
+
+@media (max-width: 480px) {
+    .mic-btn { width: 48px; height: 48px; font-size: 1.4rem; }
+}
+
+/* ── Settings Tab ── */
+.view-toggle {
+    display: flex; gap: 0.5rem; padding: 0.5rem; background: var(--surface);
+    border-bottom: 1px solid var(--border); justify-content: center;
+}
+.view-toggle button {
+    padding: 0.4rem 1rem; background: transparent; border: 1px solid var(--border);
+    color: var(--text-dim); border-radius: 6px; cursor: pointer; font-size: 0.85rem;
+    transition: all 0.2s;
+}
+.view-toggle button.active {
+    background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.settings-panel {
+    flex: 1; overflow-y: auto; padding: 1rem; display: none;
+}
+.settings-panel.active { display: block; }
+.settings-section {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 1rem; margin-bottom: 1rem; max-width: 600px; margin-left: auto; margin-right: auto;
+}
+.settings-section h3 { font-size: 1rem; margin-bottom: 0.75rem; color: #fff; }
+.voice-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.5rem; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; margin-bottom: 0.5rem;
+}
+.voice-item-info { flex: 1; }
+.voice-item-name { font-weight: 600; font-size: 0.9rem; }
+.voice-item-meta { font-size: 0.75rem; color: var(--text-dim); margin-top: 0.2rem; }
+.voice-item-actions { display: flex; gap: 0.5rem; }
+.btn-delete-voice {
+    background: transparent; border: 1px solid var(--red); color: var(--red);
+    padding: 0.3rem 0.75rem; border-radius: 4px; font-size: 0.75rem; cursor: pointer;
+}
+.btn-delete-voice:hover { background: rgba(248,81,73,0.1); }
+.btn-sync-voice {
+    background: transparent; border: 1px solid var(--accent); color: var(--accent);
+    padding: 0.3rem 0.75rem; border-radius: 4px; font-size: 0.75rem; cursor: pointer;
+}
+.btn-sync-voice:hover { background: rgba(88,166,255,0.1); }
+.upload-form { display: flex; flex-direction: column; gap: 0.75rem; }
+.upload-form input[type="file"] {
+    padding: 0.5rem; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 0.85rem;
+}
+.upload-form input[type="text"] {
+    padding: 0.5rem 0.75rem; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 0.9rem;
+}
+.upload-form button {
+    padding: 0.6rem; background: var(--accent); color: #fff; border: none;
+    border-radius: 6px; font-size: 0.9rem; cursor: pointer; font-weight: 600;
+}
+.upload-form button:disabled { opacity: 0.5; cursor: not-allowed; }
+.upload-progress {
+    font-size: 0.85rem; color: var(--text-dim); margin-top: 0.5rem; display: none;
+}
+.upload-progress.visible { display: block; }
+
+/* === Layout toggle styling === */
+.layout-toggle {
+    display: flex; align-items: center; gap: 6px; cursor: pointer;
+    padding: 2px 0; color: var(--text-dim);
+}
+.layout-toggle input[type="checkbox"] {
+    accent-color: var(--accent); cursor: pointer; margin: 0;
+}
+.layout-toggle span { font-size: 0.78rem; }
+
+/* === Fullscreen Mode === */
+body.hc-fullscreen { padding: 0 !important; gap: 0; }
+/* Default: hide everything in fullscreen */
+body.hc-fullscreen .header,
+body.hc-fullscreen #settings-panel {
+    height: 0; overflow: hidden; opacity: 0;
+    margin: 0; padding: 0; border: 0;
+    pointer-events: none;
+}
+body.hc-fullscreen .voice-bar {
+    height: 0; overflow: hidden; opacity: 0;
+    margin: 0; padding: 0; border: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease, height 0.25s ease;
+}
+/* In fullscreen with fs-show-mic, the voice-bar is visible and must accept clicks */
+body.hc-fullscreen.fs-show-mic .voice-bar {
+    pointer-events: auto;
+}
+body.hc-fullscreen .mini-player {
+    height: 0; overflow: hidden; opacity: 0;
+    margin: 0; padding: 0; border: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease, height 0.25s ease;
+}
+body.hc-fullscreen .terminal-status {
+    height: 0; overflow: hidden; opacity: 0;
+    margin: 0; padding: 0; border: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease, height 0.25s ease;
+}
+body.hc-fullscreen .mic-level-strip {
+    margin: 0 8px;
+    transition: opacity 0.25s ease;
+}
+body.hc-fullscreen .content { margin: 0; }
+body.hc-fullscreen #led-container { margin: 0; }
+body.hc-fullscreen .term-keys { border-radius: 0; }
+
+/* Configurable show overrides — each fs-show-X class re-enables its element */
+body.hc-fullscreen.fs-show-mini-player .mini-player {
+    height: auto; overflow: visible; opacity: 1;
+    margin: initial; padding: initial; border: initial;
+    pointer-events: auto;
+}
+body.hc-fullscreen.fs-show-status-bar .terminal-status {
+    height: auto; overflow: visible; opacity: 1;
+    margin: initial; padding: initial; border: initial;
+    pointer-events: auto;
+}
+body.hc-fullscreen.fs-show-mic-level .mic-level-strip {
+    opacity: 1;
+}
+body.hc-fullscreen:not(.fs-show-mic-level) .mic-level-strip {
+    height: 0; overflow: hidden; opacity: 0; margin: 0; padding: 0;
+}
+body.hc-fullscreen:not(.fs-show-term-keys) .term-keys {
+    display: none;
+}
+body.hc-fullscreen:not(.fs-show-led) #led-canvas {
+    display: none;
+}
+body.hc-fullscreen:not(.fs-show-led) #terminal-container {
+    border-radius: 8px;
+}
+/* DEPRECATED: focus-btn removed
+body.hc-fullscreen:not(.fs-show-focus-btn) #focus-btn {
+    display: none !important;
+}
+*/
+body.hc-fullscreen:not(.fs-show-badge) #agent-badge {
+    display: none;
+}
+body.hc-fullscreen.fs-show-badge #agent-badge {
+    display: block;
+}
+/* Brand banner — always visible */
+/* Menu button — no fullscreen toggle, always visible */
+body.hc-fullscreen:not(.fs-show-toast) #fs-toast {
+    display: none !important;
+}
+/* fs-scroll-bottom is now #fs-scroll-bottom in the stack */
+
+/* LED toggle — works in both regular and fullscreen */
+body.hide-led #led-canvas { display: none !important; }
+body.hide-led #terminal-container { border-radius: 8px; }
+
+/* Right-side vertical button stack — mic, volume, scroll-to-bottom */
+#fs-btn-stack {
+    display: none; position: fixed;
+    bottom: calc(var(--bottom-offset) + var(--kb-offset));
+    right: calc(16px + env(safe-area-inset-right));
+    z-index: 100;
+    flex-direction: column-reverse;
+    align-items: center;
+    gap: 10px;
+}
+body.hc-fullscreen #fs-btn-stack { display: flex; }
+#fs-btn-stack .stack-btn {
+    width: 42px; height: 42px; font-size: 20px;
+    background: rgba(58, 58, 94, 0.5); border: 1px solid rgba(255,255,255,0.15); border-radius: 50%;
+    color: #fff; cursor: pointer; opacity: 0.6;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    transition: opacity 0.2s, background 0.2s;
+    -webkit-tap-highlight-color: transparent;
+    display: none; align-items: center; justify-content: center;
+}
+#fs-btn-stack .stack-btn:active { opacity: 0.9; }
+
+/* Mic button in stack */
+#fs-mic { }
+#fs-mic.recording { background: var(--green) !important; opacity: 1 !important; }
+body.hc-fullscreen.fs-show-mic #fs-mic { display: flex; }
+/* Transport toggle — controlled by layout setting */
+body.hc-fullscreen.fs-show-transport-btn #fs-transport-btn { display: flex; font-size: 10px !important; font-weight: bold; }
+body.hc-fullscreen:not(.fs-show-transport-btn) .stack-wrap-transport { display: none !important; }
+/* GPU mode toggle — controlled by layout setting */
+body.hc-fullscreen.fs-show-gpu-toggle #fs-gpu-toggle-btn { display: flex; font-size: 14px !important; }
+body.hc-fullscreen:not(.fs-show-gpu-toggle) .stack-wrap-gpu-toggle { display: none !important; }
+/* MCP reflow toggle — controlled by layout setting */
+body.hc-fullscreen.fs-show-reflow-toggle #fs-reflow-toggle-btn { display: flex; font-size: 14px !important; }
+body.hc-fullscreen:not(.fs-show-reflow-toggle) .stack-wrap-reflow-toggle { display: none !important; }
+/* Refit terminal button — controlled by layout setting */
+body.hc-fullscreen.fs-show-refit #fs-refit-btn { display: flex; font-size: 14px !important; }
+body.hc-fullscreen:not(.fs-show-refit) .stack-wrap-refit { display: none !important; }
+body.hc-fullscreen:not(.fs-show-mic) #fs-mic { display: none; }
+
+/* Volume button in stack */
+#fs-vol-btn { font-size: 16px; }
+/* Shared popup style for volume & font sliders */
+.stack-popup {
+    display: none; position: absolute; right: 52px; top: 50%; transform: translateY(-50%);
+    padding: 10px 14px;
+    background: rgba(30,30,30,0.95); border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.15);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    z-index: 1000; touch-action: none;
+    flex-direction: column; align-items: center; gap: 6px;
+    width: 56px;
+}
+.stack-popup.open { display: flex; }
+.stack-popup .vol-pct, .stack-popup .font-pct {
+    font-size: 10px; color: rgba(255,255,255,0.5);
+    min-width: 36px; text-align: center; white-space: nowrap;
+}
+
+/* Scroll-to-bottom in stack */
+body.hc-fullscreen.fs-show-scroll-btn #fs-scroll-bottom { /* visibility controlled by JS scrollToBottom logic */ }
+body.hc-fullscreen:not(.fs-show-scroll-btn) #fs-scroll-bottom { display: none !important; }
+
+/* Volume button in stack — hide wrapper when button hidden */
+body.hc-fullscreen.fs-show-vol-btn #fs-vol-btn { display: flex; }
+body.hc-fullscreen:not(.fs-show-vol-btn) .stack-wrap-vol { display: none !important; }
+
+/* Player button in stack */
+#fs-player-btn { font-size: 16px; }
+body.hc-fullscreen.fs-show-player #fs-player-btn { display: flex; }
+body.hc-fullscreen:not(.fs-show-player) .stack-wrap-player { display: none !important; }
+.stack-player-popup {
+    display: none; position: absolute; right: 52px; top: 50%; transform: translateY(-50%);
+    padding: 16px 20px;
+    background: rgba(42, 42, 78, 0.2); border-radius: 14px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.15);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    z-index: 1000; touch-action: none;
+    flex-direction: column; align-items: stretch; gap: 12px;
+    min-width: 280px;
+}
+.stack-player-popup.open { display: flex; }
+.player-now-playing {
+    color: rgba(255,255,255,0.8); font-size: 13px; text-align: left;
+    max-width: 320px; max-height: 180px; overflow-y: auto;
+    line-height: 1.5; word-break: break-word;
+    -webkit-overflow-scrolling: touch;
+}
+.player-controls { display: flex; gap: 12px; align-items: center; }
+.player-ctrl-btn {
+    width: 48px; height: 48px; font-size: 22px;
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 50%; color: #fff; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    -webkit-tap-highlight-color: transparent;
+    transition: background 0.15s;
+}
+.player-ctrl-btn:active { background: rgba(255,255,255,0.2); }
+.player-ctrl-btn:disabled { opacity: 0.3; pointer-events: none; }
+.player-ctrl-btn.playing { background: rgba(88,166,255,0.2); border-color: rgba(88,166,255,0.4); }
+
+/* Font size button in stack — hide wrapper when button hidden */
+#fs-font-btn { font-family: serif; font-weight: bold; font-size: 18px; }
+body.hc-fullscreen.fs-show-font-btn #fs-font-btn { display: flex; }
+body.hc-fullscreen:not(.fs-show-font-btn) .stack-wrap-font { display: none !important; }
+
+/* Upload button in stack */
+#fs-upload { font-size: 20px; }
+body.hc-fullscreen.fs-show-upload #fs-upload { display: flex; }
+body.hc-fullscreen:not(.fs-show-upload) #fs-upload { display: none !important; }
+/* Files button in stack */
+#fs-files-btn { }
+body.hc-fullscreen.fs-show-files #fs-files-btn { display: flex; }
+body.hc-fullscreen:not(.fs-show-files) #fs-files-btn { display: none !important; }
+
+/* Info button in stack */
+#fs-info-btn { }
+body.hc-fullscreen.fs-show-info #fs-info-btn { display: flex; }
+body.hc-fullscreen:not(.fs-show-info) #fs-info-btn { display: none !important; }
+
+/* Audio devices button in stack — iOS only, gated by NativeBridge capability */
+#fs-audio-devices-btn { font-size: 18px; }
+body.hc-fullscreen.fs-show-audio-devices #fs-audio-devices-btn { display: flex; }
+body.hc-fullscreen:not(.fs-show-audio-devices) .stack-wrap-audio-devices { display: none !important; }
+.stack-audio-devices-popup {
+    display: none; position: absolute; right: 52px; top: 50%; transform: translateY(-50%);
+    padding: 16px 18px;
+    background: rgba(42, 42, 78, 0.2); border-radius: 14px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.15);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    z-index: 1000; touch-action: none;
+    flex-direction: column; align-items: stretch; gap: 10px;
+    min-width: 260px;
+}
+.stack-audio-devices-popup.open { display: flex; }
+.audio-devices-section-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: rgba(255,255,255,0.4); margin-bottom: 2px;
+}
+.audio-devices-input-list {
+    display: flex; flex-direction: column; gap: 4px;
+}
+.audio-devices-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border-radius: 10px;
+    background: rgba(255,255,255,0.06); border: 1px solid transparent;
+    color: rgba(255,255,255,0.75); font-size: 13px;
+    cursor: pointer; text-align: left; width: 100%;
+    -webkit-tap-highlight-color: transparent;
+    transition: background 0.15s;
+}
+.audio-devices-row:active { background: rgba(255,255,255,0.12); }
+.audio-devices-row.active {
+    background: rgba(88,166,255,0.15); border-color: rgba(88,166,255,0.35);
+    color: rgba(255,255,255,0.95);
+}
+.audio-devices-row-icon { font-size: 16px; flex-shrink: 0; }
+.audio-devices-row-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audio-devices-empty {
+    font-size: 12px; color: rgba(255,255,255,0.35); padding: 6px 0; text-align: center;
+}
+.audio-devices-divider {
+    height: 1px; background: rgba(255,255,255,0.1); margin: 2px 0;
+}
+.audio-devices-output-row {
+    display: flex; align-items: center; gap: 10px; padding: 4px 0;
+}
+.audio-devices-route-icon { font-size: 16px; flex-shrink: 0; }
+.audio-devices-route {
+    flex: 1; font-size: 13px; color: rgba(255,255,255,0.75);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.audio-devices-output-btn {
+    width: 36px; height: 36px; font-size: 14px; flex-shrink: 0;
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 50%; color: #fff; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    -webkit-tap-highlight-color: transparent;
+    transition: background 0.15s;
+}
+.audio-devices-output-btn:active { background: rgba(255,255,255,0.2); }
+
+/* Files panel — full-screen overlay */
+.files-panel {
+    display: none; position: fixed; inset: 0; z-index: 2000;
+    background: #0d0d1a;
+    flex-direction: column;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+.files-panel.open { display: flex; }
+/* When files panel is open: hide all stack buttons, then selectively show */
+.files-panel.open ~ #fs-btn-stack { z-index: 2001; }
+.files-panel.open ~ #fs-btn-stack .stack-btn { display: none; }
+.files-panel.open ~ #fs-btn-stack .stack-wrap-font { display: none; }
+.files-panel.open ~ #fs-btn-stack .stack-wrap-vol { display: none; }
+/* Show mic only if enabled in layout */
+body.fs-show-mic .files-panel.open ~ #fs-btn-stack #fs-mic { display: flex; }
+body.fs-show-transport-btn .files-panel.open ~ #fs-btn-stack .stack-wrap-transport { display: block; }
+body.fs-show-transport-btn .files-panel.open ~ #fs-btn-stack #fs-transport-btn { display: flex; }
+body.fs-show-gpu-toggle .files-panel.open ~ #fs-btn-stack .stack-wrap-gpu-toggle { display: block; }
+body.fs-show-gpu-toggle .files-panel.open ~ #fs-btn-stack #fs-gpu-toggle-btn { display: flex; }
+body.fs-show-reflow-toggle .files-panel.open ~ #fs-btn-stack .stack-wrap-reflow-toggle { display: block; }
+body.fs-show-reflow-toggle .files-panel.open ~ #fs-btn-stack #fs-reflow-toggle-btn { display: flex; }
+/* Show font slider only if enabled in layout */
+body.fs-show-font-btn .files-panel.open ~ #fs-btn-stack .stack-wrap-font { display: block; }
+body.fs-show-font-btn .files-panel.open ~ #fs-btn-stack #fs-font-btn { display: flex; }
+/* Show upload button in file browser */
+.files-panel.open ~ #fs-btn-stack #fs-upload { display: flex; }
+.files-panel.open ~ #fs-toast { z-index: 2001; }
+.files-panel.open ~ .mic-level-strip { z-index: 2001; }
+.files-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; padding-top: calc(8px + env(safe-area-inset-top));
+    background: rgba(20, 20, 40, 0.95);
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+    min-height: 48px;
+}
+.files-back-btn, .files-close-btn {
+    background: none; border: none; color: #8888ff; font-size: 22px;
+    padding: 8px; cursor: pointer; -webkit-tap-highlight-color: transparent;
+    min-width: 40px; min-height: 40px;
+    display: flex; align-items: center; justify-content: center;
+}
+.files-paste-btn {
+    background: rgba(88,166,255,0.15); border: 1px solid rgba(88,166,255,0.4);
+    color: #58a6ff; font-size: 12px; padding: 4px 10px; border-radius: 6px;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+    white-space: nowrap; flex-shrink: 0;
+}
+.files-paste-btn:active { background: rgba(88,166,255,0.3); }
+.files-path-input {
+    flex: 1; color: rgba(255,255,255,0.8); font-size: 13px;
+    font-family: 'JetBrains Mono', monospace;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 6px; padding: 6px 10px;
+    outline: none; min-width: 0;
+}
+.files-path-input:focus {
+    border-color: #8888ff; background: rgba(255,255,255,0.1);
+}
+.files-body { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+.files-tree {
+    flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 4px 0;
+}
+.files-loading { color: rgba(255,255,255,0.4); padding: 20px; text-align: center; }
+.file-entry {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; cursor: pointer;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none; user-select: none;
+    transition: background 0.1s;
+}
+.file-entry:active { background: rgba(255,255,255,0.06); }
+.file-entry-icon { font-size: var(--files-font-size, 18px); min-width: 24px; text-align: center; }
+.file-entry-name {
+    flex: 1; color: rgba(255,255,255,0.85); font-size: var(--files-font-size, 14px);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: 'JetBrains Mono', monospace;
+}
+.file-entry-name.is-dir { color: #8888ff; }
+.file-entry-size {
+    color: rgba(255,255,255,0.3); font-size: calc(var(--files-font-size, 14px) * 0.78); white-space: nowrap;
+}
+
+/* Info panel — full-screen overlay */
+.info-panel {
+    display: none; position: fixed; inset: 0; z-index: 2000;
+    background: #0d0d1a;
+    flex-direction: column;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+.info-panel.open { display: flex; }
+.info-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; padding-top: calc(8px + env(safe-area-inset-top));
+    background: rgba(20, 20, 40, 0.95);
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+    min-height: 48px;
+}
+.info-title {
+    color: rgba(255,255,255,0.9); font-size: 15px; font-weight: 600;
+    white-space: nowrap;
+}
+.info-history-select {
+    flex: 1; min-width: 0;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 6px; padding: 6px 8px;
+    color: rgba(255,255,255,0.7); font-size: 12px;
+    outline: none; cursor: pointer;
+    display: none;
+}
+.info-history-select.has-items { display: block; }
+.info-close-btn {
+    background: none; border: none; color: #8888ff; font-size: 22px;
+    padding: 8px; cursor: pointer; -webkit-tap-highlight-color: transparent;
+    min-width: 40px; min-height: 40px;
+    display: flex; align-items: center; justify-content: center;
+}
+.info-body {
+    flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+}
+.info-content {
+    padding: 16px 20px;
+    color: rgba(255,255,255,0.85); font-size: 14px; line-height: 1.6;
+    word-wrap: break-word;
+}
+.info-content a { color: #8888ff; }
+.info-content img { max-width: 100%; border-radius: 4px; }
+.info-content h1,.info-content h2,.info-content h3 { color: #ccc; margin: 1em 0 0.5em; }
+.info-content code { background: rgba(255,255,255,0.08); padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+.info-content pre { background: rgba(255,255,255,0.05); padding: 12px; border-radius: 6px; overflow-x: auto; }
+.info-content pre code { background: none; padding: 0; }
+.info-content ul, .info-content ol { padding-left: 1.5em; }
+.info-content table { border-collapse: collapse; width: 100%; }
+.info-content th, .info-content td { border: 1px solid rgba(255,255,255,0.1); padding: 6px 10px; text-align: left; }
+.info-content th { background: rgba(255,255,255,0.05); }
+.info-empty { color: rgba(255,255,255,0.3); text-align: center; padding: 40px 20px; }
+/* When info panel is open: keep mic visible */
+.info-panel.open ~ #fs-btn-stack { z-index: 2001; }
+.info-panel.open ~ #fs-btn-stack .stack-btn { display: none; }
+body.fs-show-mic .info-panel.open ~ #fs-btn-stack #fs-mic { display: flex; }
+body.fs-show-transport-btn .info-panel.open ~ #fs-btn-stack #fs-transport-btn { display: flex; }
+body.fs-show-gpu-toggle .info-panel.open ~ #fs-btn-stack #fs-gpu-toggle-btn { display: flex; }
+body.fs-show-reflow-toggle .info-panel.open ~ #fs-btn-stack #fs-reflow-toggle-btn { display: flex; }
+.info-panel.open ~ #fs-toast { z-index: 2001; }
+.info-panel.open ~ .mic-level-strip { z-index: 2001; }
+
+/* Animations panel — LED animation manager */
+.animations-panel {
+    display: none; position: fixed; inset: 0; z-index: 2000;
+    background: #0d0d1a;
+    flex-direction: column; overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+.animations-panel.open { display: flex; }
+.anim-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.1);
+    flex-shrink: 0;
+}
+.anim-title { font-size: 0.9rem; font-weight: 600; color: #e0e0e0; flex: 1; }
+.anim-close-btn {
+    background: none; border: none; color: rgba(255,255,255,0.5);
+    font-size: 1.4rem; cursor: pointer; padding: 0 4px; line-height: 1;
+}
+.anim-close-btn:hover { color: #fff; }
+.anim-body { flex: 1; overflow-y: auto; padding: 12px 16px; }
+.anim-section-label {
+    font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;
+    color: rgba(255,255,255,0.4); margin-bottom: 8px;
+}
+.anim-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 8px; border-radius: 8px; margin-bottom: 4px;
+    transition: opacity 0.2s;
+}
+.anim-row:hover { background: rgba(255,255,255,0.04); }
+.anim-row.disabled { opacity: 0.4; }
+.anim-toggle {
+    flex-shrink: 0; width: 16px; height: 16px;
+    accent-color: var(--accent, #58a6ff); cursor: pointer;
+}
+.anim-info { flex: 1; min-width: 0; }
+.anim-name {
+    display: block; font-size: 0.82rem; font-weight: 500; color: #e0e0e0;
+}
+.anim-desc {
+    display: block; font-size: 0.7rem; color: rgba(255,255,255,0.4);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.anim-file-link {
+    flex-shrink: 0; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 6px; color: var(--accent, #58a6ff); font-size: 0.7rem;
+    padding: 3px 8px; cursor: pointer; font-family: monospace;
+}
+.anim-file-link:hover { background: rgba(88,166,255,0.15); }
+.anim-delete-btn {
+    flex-shrink: 0; background: none; border: none;
+    color: rgba(255,100,100,0.6); font-size: 1.1rem; cursor: pointer; padding: 0 4px;
+}
+.anim-delete-btn:hover { color: #ff6464; }
+.anim-hint {
+    margin-top: 16px; padding: 12px; border-radius: 8px;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+    font-size: 0.72rem; color: rgba(255,255,255,0.35); text-align: center;
+}
+
+/* Context menu for file operations */
+.files-context-menu {
+    display: none; position: fixed; z-index: 10001;
+    background: #2a2d35; border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 10px; padding: 4px 0; min-width: 160px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+}
+.files-context-menu.visible { display: block; }
+.files-context-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; cursor: pointer; color: rgba(255,255,255,0.85);
+    font-size: 14px; -webkit-tap-highlight-color: transparent;
+}
+.files-context-item:active { background: rgba(255,255,255,0.08); }
+.files-context-item.danger { color: #ff6b6b; }
+.files-context-sep { height: 1px; background: rgba(255,255,255,0.1); margin: 4px 0; }
+.files-context-overlay {
+    display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    z-index: 10000; background: rgba(0,0,0,0.3);
+}
+.files-context-overlay.visible { display: block; }
+
+/* File viewer */
+.files-viewer { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+.files-viewer-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 16px;
+    background: rgba(20, 20, 40, 0.8);
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.files-viewer-name {
+    color: rgba(255,255,255,0.9); font-size: 13px;
+    font-family: 'JetBrains Mono', monospace;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.files-viewer-meta {
+    color: rgba(255,255,255,0.3); font-size: 11px; white-space: nowrap;
+}
+.files-viewer-content {
+    flex: 1; overflow: auto; -webkit-overflow-scrolling: touch;
+    background: #0a0a18;
+}
+.files-viewer-content pre {
+    margin: 0; padding: 12px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: var(--files-font-size, 12px); line-height: 1.5;
+    tab-size: 4; white-space: pre; overflow-x: auto;
+}
+.files-viewer-content code {
+    color: rgba(255,255,255,0.8);
+}
+/* Shiki overrides — transparent background, respect our theme */
+.files-viewer-content .shiki { background: transparent !important; }
+/* Line numbers */
+.files-viewer-content .code-line {
+    display: flex;
+}
+.files-viewer-content .line-no {
+    display: inline-block; min-width: 2.5em; text-align: right;
+    padding-right: 1em; color: rgba(255,255,255,0.2);
+    user-select: none; -webkit-user-select: none; flex-shrink: 0;
+}
+.files-viewer-content .line-code { flex: 1; min-width: 0; }
+/* Wrap mode */
+.files-viewer-content.wrap-lines pre { white-space: pre-wrap; word-break: break-all; }
+.files-viewer-content.wrap-lines .line-code { white-space: pre-wrap; word-break: break-all; }
+.files-editor-wrap.wrap-lines .cm-content { white-space: pre-wrap !important; }
+.files-editor-wrap.wrap-lines .cm-line { word-break: break-all; }
+/* Viewer action buttons */
+.files-viewer-actions { display: flex; gap: 6px; align-items: center; }
+.files-edit-btn {
+    background: none; border: 1px solid rgba(255,255,255,0.15); color: #8888ff;
+    border-radius: 6px; padding: 4px 10px; font-size: 14px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+.files-save-btn {
+    background: #4040cc; border: none; color: #fff;
+    border-radius: 6px; padding: 4px 12px; font-size: 13px; font-weight: 600;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.files-save-btn:active { background: #3030aa; }
+.files-toggle-btn {
+    background: none; border: 1px solid rgba(255,255,255,0.12); color: rgba(255,255,255,0.4);
+    border-radius: 4px; padding: 2px 6px; font-size: 11px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent; white-space: nowrap;
+}
+.files-toggle-btn.active { color: #58a6ff; border-color: rgba(88,166,255,0.4); }
+/* CodeMirror editor wrapper — dark theme via CSS (can't use oneDark extension
+   because separate ?bundle-deps imports create duplicate @codemirror/state) */
+.files-editor-wrap { flex: 1; overflow: auto; -webkit-overflow-scrolling: touch; }
+.files-editor-wrap .cm-editor { height: 100%; font-size: var(--files-font-size, 13px); background: #282c34; }
+.files-editor-wrap .cm-scroller { overflow: auto; }
+.files-editor-wrap .cm-content { font-family: 'JetBrains Mono', monospace; color: #abb2bf; caret-color: #528bff; }
+.files-editor-wrap .cm-gutters { background: #21252b; color: #636d83; border-right: 1px solid #181a1f; }
+.files-editor-wrap .cm-activeLineGutter { background: #2c313a; }
+.files-editor-wrap .cm-activeLine { background: rgba(44, 49, 58, 0.5); }
+.files-editor-wrap .cm-selectionBackground, .files-editor-wrap ::selection { background: #3e4451 !important; }
+.files-editor-wrap .cm-cursor { border-left-color: #528bff; }
+.files-editor-wrap .cm-matchingBracket { color: #61afef !important; background: rgba(97,175,239,0.15); }
+.files-editor-wrap .cm-searchMatch { background: rgba(229,192,123,0.3); }
+.files-editor-wrap .cm-focused { outline: none; }
+/* Image viewer */
+.files-image-wrap {
+    flex: 1; overflow: auto; -webkit-overflow-scrolling: touch;
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px; background: #0a0a18;
+}
+.files-image-wrap img {
+    max-width: 100%; max-height: 100%; object-fit: contain;
+    border-radius: 4px;
+}
+/* Markdown rendered view */
+.files-md-wrap {
+    flex: 1; overflow: auto; -webkit-overflow-scrolling: touch;
+    padding: 16px 20px; background: #0a0a18;
+    color: rgba(255,255,255,0.85); font-size: var(--files-font-size, 14px); line-height: 1.6;
+}
+.files-md-wrap h1,.files-md-wrap h2,.files-md-wrap h3 { color: #ccc; margin: 1em 0 0.5em; }
+.files-md-wrap h1 { font-size: 1.4em; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 0.3em; }
+.files-md-wrap h2 { font-size: 1.2em; }
+.files-md-wrap code { background: rgba(255,255,255,0.08); padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+.files-md-wrap pre { background: rgba(255,255,255,0.05); padding: 12px; border-radius: 6px; overflow-x: auto; }
+.files-md-wrap pre code { background: none; padding: 0; }
+.files-md-wrap a { color: #8888ff; }
+.files-md-wrap ul, .files-md-wrap ol { padding-left: 1.5em; }
+.files-md-wrap blockquote { border-left: 3px solid rgba(255,255,255,0.2); padding-left: 12px; color: rgba(255,255,255,0.6); margin: 0.5em 0; }
+.files-md-wrap img { max-width: 100%; border-radius: 4px; }
+.files-md-wrap table { border-collapse: collapse; width: 100%; }
+.files-md-wrap th, .files-md-wrap td { border: 1px solid rgba(255,255,255,0.1); padding: 6px 10px; text-align: left; }
+.files-md-wrap th { background: rgba(255,255,255,0.05); }
+/* Toggle between rendered/source for markdown */
+.files-md-toggle {
+    position: absolute; top: 8px; right: 8px;
+    background: rgba(255,255,255,0.1); border: none; color: rgba(255,255,255,0.6);
+    border-radius: 4px; padding: 4px 8px; font-size: 11px; cursor: pointer;
+    z-index: 1;
+}
+
+/* Mic position variants */
+
+:root { --kb-offset: 0px; --bottom-offset: 70px; }
+/* Collapsible text input — morphs from circle to pill */
+#fs-text-input-wrap {
+    display: none; position: fixed;
+    bottom: calc(var(--bottom-offset) + var(--kb-offset));
+    left: calc(16px + env(safe-area-inset-left));
+    width: 42px; height: 42px;
+    z-index: 100;
+    background: rgba(58, 58, 94, 0.5);
+    border: 1px solid rgba(255,255,255,0.15); border-radius: 21px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    overflow: hidden; cursor: pointer;
+    transition: width 0.3s ease, height 0.3s ease, background 0.3s ease,
+                backdrop-filter 0.3s ease, -webkit-backdrop-filter 0.3s ease,
+                border-radius 0.3s ease;
+    -webkit-tap-highlight-color: transparent;
+}
+body.hc-fullscreen.fs-show-text-input #fs-text-input-wrap { display: block; }
+/* Expanded state — default: all the way to screen edge */
+#fs-text-input-wrap.open {
+    width: auto; right: calc(16px + env(safe-area-inset-right));
+    height: auto; min-height: 42px;
+    background: rgba(30, 30, 50, 0.75);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-radius: 21px; cursor: default;
+}
+/* With mic on: stop before mic */
+body.hc-fullscreen.fs-show-mic #fs-text-input-wrap.open {
+    right: calc(66px + env(safe-area-inset-right));
+}
+/* With upload on: stop before upload (upload is left of mic) */
+body.hc-fullscreen.fs-show-upload #fs-text-input-wrap.open {
+    right: calc(116px + env(safe-area-inset-right));
+}
+/* With both upload + mic: stop before upload */
+body.hc-fullscreen.fs-show-upload.fs-show-mic #fs-text-input-wrap.open {
+    right: calc(116px + env(safe-area-inset-right));
+}
+/* > icon — visible when collapsed, stays as left indicator when open */
+#fs-text-btn {
+    position: absolute; top: 0; left: 0;
+    width: 42px; height: 42px; font-size: 20px;
+    background: none; border: none; border-radius: 50%;
+    color: #fff; opacity: 0.6; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1; -webkit-tap-highlight-color: transparent;
+}
+#fs-text-btn:active { opacity: 0.9; }
+/* Text field — hidden when collapsed */
+#fs-text-input {
+    display: none; width: calc(100% - 42px); margin-left: 42px;
+    padding: 10px 14px 10px 0; max-height: 120px;
+    background: transparent; border: none;
+    color: #fff; font-size: 14px;
+    resize: none; outline: none; overflow-y: auto;
+}
+#fs-text-input-wrap.open #fs-text-input { display: block; }
+#fs-text-input::placeholder { color: rgba(255,255,255,0.35); }
+
+/* DEPRECATED: Focus button removed — regular view is deprecated.
+#focus-btn {
+    position: fixed; top: calc(12px + env(safe-area-inset-top)); right: calc(12px + env(safe-area-inset-right)); z-index: 100;
+    width: 40px; height: 40px;
+    background: rgba(30, 30, 50, 0.5); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 10px; color: rgba(255,255,255,0.7);
+    font-size: 20px; line-height: 1;
+    cursor: pointer;
+    box-shadow: 0 1px 6px rgba(0,0,0,0.25);
+    display: flex; align-items: center; justify-content: center;
+    -webkit-tap-highlight-color: transparent;
+    transition: background 0.2s;
+}
+#focus-btn:hover { background: rgba(60, 60, 100, 0.7); }
+*/
+
+/* Toast popup — multi-line, above floating controls, grows upward */
+#fs-toast {
+    display: none; position: fixed;
+    top: calc(72px + env(safe-area-inset-top));
+    left: calc(16px + env(safe-area-inset-left));
+    right: calc(16px + env(safe-area-inset-right));
+    z-index: 101;
+    background: rgba(42, 42, 78, 0.12); color: var(--accent, #a78bfa);
+    padding: 8px 16px; border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    font-size: 12px; white-space: normal; word-wrap: break-word;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+}
+
+/* Scroll-bottom now lives in #fs-btn-stack — no standalone repositioning needed */
+
+/* === Header hidden permanently — replaced by drawer === */
+.header { display: none !important; }
+
+/* Agent name badge — top-right floating */
+#agent-badge {
+    position: fixed; top: calc(14px + env(safe-area-inset-top)); right: 14px;
+    z-index: 99;
+    padding: 4px 14px;
+    background: rgba(30, 30, 50, 0.45);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+    color: rgba(255,255,255,0.5);
+    font-size: 0.7rem; letter-spacing: 0.02em;
+    pointer-events: none;
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+}
+/* Brand banner — top-center floating overlay, matches agent-badge style */
+#brand-banner {
+    position: fixed !important; top: calc(14px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
+    z-index: 99;
+    padding: 3px 16px;
+    background: rgba(30, 30, 50, 0.45) !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
+    border-radius: 16px;
+    pointer-events: none;
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+}
+.drawer-row {
+    display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+}
+/* Old settings panel hidden — contents moved to drawer */
+#settings-panel { display: none !important; }
+/* Hidden credit/autorefill elements (JS compat only, not visible) */
+#drawer-hidden-compat { display: none !important; }
+

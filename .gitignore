@@ -1,0 +1,47 @@
+# Build artifacts
+target/
+*.o
+*.so
+*.dylib
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# GPU worker
+gpu-worker/.hf_token
+gpu-worker/voices/
+gpu-worker/voices/.cache/
+gpu-worker/*.wav
+gpu-worker/*.pt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (if any)
+node_modules/
+
+# Logs & temp
+*.log
+/tmp/
+node_modules/
+package.json
+package-lock.json

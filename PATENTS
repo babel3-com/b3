@@ -1,0 +1,60 @@
+# Patent Notice
+
+Certain technologies in this repository are covered by pending patent applications
+filed by Babel17.ai LLC.
+
+Under the Apache License 2.0 (Section 3), all users of this software automatically
+receive an irrevocable, perpetual, worldwide patent license for the patent claims
+embodied in this code. No additional patent license is required.
+
+These patents exist solely to protect against proprietary reimplementation by parties
+who do not use this open-source code. They impose no restrictions on users,
+contributors, or distributors of this software.
+
+## Patent Applications
+
+| Application # | Title | Filed |
+|---------------|-------|-------|
+| US 64/010,742 | System and Method for Embedding-Based Semantic Dispatch of Natural Language Intent to Pre-Computed Capability Libraries | March 19, 2026 |
+| US 64/010,891 | Multi-Model Interpretive Disagreement Preservation and Injection for Ambiguity-Aware Reasoning via Large Language Models | March 19, 2026 |
+| US 64/011,207 | Dynamic Embedding-Based Rejection Databases for Collaborative Signal Filtering Across Sensory Modalities | March 20, 2026 |
+
+## Covered Technologies
+
+1. **Embedding-based semantic dispatch (chromatophore)** — US 64/010,742. System for
+   translating AI agent emotion descriptors to LED animations and on-screen visual
+   simulations via semantic embedding matching against a pre-computed capability library.
+   Covers the emotion-to-animation mapping in `browser/js/led.js` and the semantic
+   dispatch algorithm.
+
+2. **Multi-model interpretive disagreement** — US 64/010,891. Method of processing input
+   signals through multiple independent models and injecting all outputs into a large
+   language model simultaneously, preserving inter-model disagreement as informational
+   signal. Covers the dual-model transcription pipeline in `gpu-worker/handler.py`,
+   self-similarity scoring, confidence tiering, and disagreement-modulated behavioral
+   policy.
+
+3. **Dynamic embedding-based rejection databases** — US 64/011,207. System for filtering
+   unwanted signals using embedding-based semantic similarity against a dynamic rejection
+   database collaboratively grown by users and autonomous agents. Covers the hallucination
+   detection pipeline, speaker rejection via diarization, per-entry adaptive similarity
+   radii, and the collaborative growth mechanism.
+
+## What This Means for You
+
+- **Using this code?** You have full patent rights automatically. Apache 2.0 Section 3
+  grants you an irrevocable patent license. Nothing to sign, nothing to pay.
+
+- **Contributing to this code?** Your contributions are welcome. Apache 2.0 Section 5
+  ensures your contributions are licensed under the same terms, including patent rights.
+
+- **Building on this code?** Fork it, modify it, build products on it. The patent grant
+  covers derivative works that incorporate this code.
+
+- **Reimplementing without this code?** If you independently reimplement these techniques
+  without using any of this code, the Apache 2.0 patent grant does not apply. This is
+  the standard distinction in Apache 2.0 licensing.
+
+- **If you institute patent litigation** against any entity alleging that the Work
+  constitutes patent infringement, your patent license terminates automatically
+  (Apache 2.0 Section 3, defensive termination).
