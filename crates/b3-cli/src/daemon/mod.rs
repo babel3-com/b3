@@ -1,4 +1,5 @@
 pub mod ec2_proxy;
+pub mod fork_state;
 pub mod gpu_client;
 pub mod info_archive;
 pub mod ipc;

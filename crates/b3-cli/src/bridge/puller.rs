@@ -1,7 +1,7 @@
 //! Inbound: SSE events → PTY injection.
 //!
-//! Holds SSE connection to GET /api/agents/{id}/events over the mesh.
-//! Dispatches events to PTY writer for injection:
+//! Fans out SSE connections to GET /api/agents/{id}/events over direct HTTPS
+//! to all configured servers (primary + peers). Dispatches events to PTY writer for injection:
 //!   - "transcription" → write text + \n to PTY stdin
 //!   - "hive"          → write [HIVE from={sender}] {message}\n to PTY stdin
 //!
@@ -1092,13 +1092,13 @@ mod tests {
             agent_email: "test@hey-code.ai".to_string(),
             api_key: "test-key".to_string(),
             api_url: "https://test.example.com".to_string(),
-            wg_address: "10.44.0.1".to_string(),
-            relay_endpoint: "127.0.0.1:51820".to_string(),
-            relay_public_key: "AAAA".to_string(),
             push_interval_ms: 100,
             web_url: "https://test.example.com/a/test".to_string(),
             b3_version: "0.0.0".to_string(),
             servers: vec![],
+            wg_address: String::new(),
+            relay_endpoint: String::new(),
+            relay_public_key: String::new(),
         }
     }
 
@@ -1183,13 +1183,13 @@ mod failure_tests {
             agent_email: "test@hey-code.ai".to_string(),
             api_key: "test-key".to_string(),
             api_url: "https://test.example.com".to_string(),
-            wg_address: "10.44.0.1".to_string(),
-            relay_endpoint: "127.0.0.1:51820".to_string(),
-            relay_public_key: "AAAA".to_string(),
             push_interval_ms: 100,
             web_url: "https://test.example.com/a/test".to_string(),
             b3_version: "0.0.0".to_string(),
             servers: vec![],
+            wg_address: String::new(),
+            relay_endpoint: String::new(),
+            relay_public_key: String::new(),
         }
     }
 

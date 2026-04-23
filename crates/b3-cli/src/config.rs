@@ -1,74 +1,49 @@
-//! ~/.b3/config.json management.
+//! Config directory resolution and config.json management.
 //!
 //! Config struct stores everything the agent needs to connect:
 //!   - Identity: agent_id, agent_email
 //!   - Auth: api_key
-//!   - Mesh: wg_address, relay_endpoint, relay_public_key
-//!   - URLs: api_url (public, for initial setup only), web_url (dashboard)
+//!   - URLs: api_url (public HTTPS), web_url (dashboard)
 //!
-//! All runtime agent-to-server comms go through the WireGuard mesh.
-//! The agent reaches the API server via the tunnel (default: 10.44.0.1:3100,
-//! configurable via B3_SERVER_MESH_IP / B3_SERVER_MESH_PORT env vars).
-//! api_url (public HTTPS) is only used during initial `b3 setup`.
+//! All runtime agent-to-server comms go through the EC2 encrypted proxy
+//! (`daemon/ec2_proxy.rs`). api_url is used for initial setup and direct HTTPS calls.
+//!
+//! Config directory resolution (checked in order):
+//!   1. fork_state::config_dir() static (set by pre_fork before daemon start)
+//!   2. ./.b3/ in the current working directory
+//!   3. Walk up to $HOME looking for .b3/config.json
+//!   4. ~/.b3/ (default, existing behavior)
+//!
+//! Resolution runs once at process startup via OnceLock. For the daemon process,
+//! fork_state::init() is called before fork() so the child inherits the value
+//! without any env var pollution.
 //!
 //! Read/write with serde_json. Created during setup, read on every start.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-/// Server's mesh IP — the relay runs the API server at this address.
-/// Override with B3_SERVER_MESH_IP for self-hosted deployments.
-pub fn server_mesh_ip() -> String {
-    std::env::var("B3_SERVER_MESH_IP").unwrap_or_else(|_| "10.44.0.1".to_string())
-}
+static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Server's mesh port. Override with B3_SERVER_MESH_PORT.
-pub fn server_mesh_port() -> u16 {
-    std::env::var("B3_SERVER_MESH_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3100)
-}
-
-/// Local TCP proxy port — the userspace tunnel listens here.
-/// Agent code (reqwest, SSE) connects to 127.0.0.1:MESH_PROXY_PORT
-/// which is forwarded through the WireGuard tunnel to 10.44.0.1:3000.
-/// Override with B3_MESH_PROXY_PORT env var for multi-tenant hosting.
-pub const MESH_PROXY_PORT_DEFAULT: u16 = 13000;
-
-pub fn mesh_proxy_port() -> u16 {
-    // 1. Env var override (explicit)
-    if let Ok(port) = std::env::var("B3_MESH_PROXY_PORT") {
-        if let Ok(p) = port.parse() {
-            return p;
-        }
-    }
-    // 2. Runtime port file (written by daemon after binding, handles fallback)
-    if let Some(home) = dirs::home_dir() {
-        let port_file = home.join(".b3").join("mesh-proxy.port");
-        if let Ok(contents) = std::fs::read_to_string(&port_file) {
-            if let Ok(p) = contents.trim().parse() {
-                return p;
-            }
-        }
-    }
-    // 3. Default
-    MESH_PROXY_PORT_DEFAULT
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub agent_id: String,
     pub agent_email: String,
     pub api_key: String,
-    /// Public API URL — used ONLY for initial registration (before mesh is up).
+    /// Public API URL — used for initial registration and direct HTTPS calls.
     pub api_url: String,
-    /// Agent's mesh IP (e.g. "10.44.1.15").
+    /// Agent's mesh IP — retained for config.json compatibility with existing installs.
+    /// No longer used for routing; all traffic goes through the EC2 proxy.
+    #[serde(default)]
     pub wg_address: String,
-    /// Relay endpoint for WireGuard tunnel (e.g. "34.x.x.x:51820").
+    /// Relay endpoint — retained for config.json compatibility.
+    #[serde(default)]
     pub relay_endpoint: String,
-    /// Relay's WireGuard public key (base64).
+    /// Relay WireGuard public key — retained for config.json compatibility.
+    #[serde(default)]
     pub relay_public_key: String,
     pub push_interval_ms: u64,
     pub web_url: String,
@@ -81,16 +56,13 @@ pub struct Config {
     /// Daemon connects to all servers independently for redundancy.
     #[serde(default)]
     pub servers: Vec<String>,
+    /// When true, `b3 start` runs `b3 update` before launching the daemon.
+    /// Opt-in during setup or via manual edit of .b3/config.json. Default: false.
+    #[serde(default)]
+    pub auto_update: bool,
 }
 
 impl Config {
-    /// URL for API calls over the mesh via the local tunnel proxy.
-    /// HTTP, not HTTPS — encryption is handled by WireGuard at the tunnel layer.
-    #[allow(dead_code)]
-    pub fn mesh_api_url(&self) -> String {
-        format!("http://127.0.0.1:{}", mesh_proxy_port())
-    }
-
     /// Domain extracted from api_url (e.g., "babel3.com" from "https://babel3.com").
     /// Used for CORS origins, tunnel hostnames, GPU proxy URLs, etc.
     pub fn server_domain(&self) -> &str {
@@ -105,14 +77,70 @@ impl Config {
 }
 
 impl Config {
-    /// Directory for all Babel3 config: ~/.b3/
-    pub fn config_dir() -> PathBuf {
+    /// Resolve the config directory for this process (runs once, cached via OnceLock).
+    ///
+    /// Resolution order:
+    ///   1. fork_state::config_dir() static (set by pre_fork before daemon fork)
+    ///   2. ./.b3/ in CWD (if contains config.json)
+    ///   3. Walk up from CWD to $HOME looking for .b3/config.json
+    ///   4. ~/.b3/ (home default)
+    fn resolve_config_dir() -> PathBuf {
+        // 1. Fork state static — set by pre_fork/start_in_process before the daemon starts.
+        //    Avoids the previous B3_CONFIG_DIR env-var approach that leaked into all descendants.
+        if let Some(dir) = crate::daemon::fork_state::config_dir() {
+            return dir.clone();
+        }
+
+        // 2+3. Walk up from CWD looking for .b3/config.json, stopping at $HOME
+        if let Ok(cwd) = std::env::current_dir() {
+            let home = dirs::home_dir().unwrap_or_default();
+            let mut dir = cwd.as_path();
+            loop {
+                let candidate = dir.join(".b3");
+                if candidate.join("config.json").exists() {
+                    return candidate;
+                }
+                // Don't walk above home
+                if dir == home || dir.parent().is_none() {
+                    break;
+                }
+                dir = dir.parent().unwrap();
+            }
+        }
+
+        // 4. Home default
         dirs::home_dir()
             .expect("could not determine home directory")
             .join(".b3")
     }
 
-    /// Path to main config file: ~/.b3/config.json
+    /// Directory for all Babel3 config (resolved once per process).
+    pub fn config_dir() -> PathBuf {
+        CONFIG_DIR.get_or_init(Self::resolve_config_dir).clone()
+    }
+
+    /// Called at the start of `b3 setup` to pin the config dir to CWD's .b3/
+    /// when CWD is not $HOME and no explicit override is set.
+    ///
+    /// Without this, setup would fall through to ~/.b3/ in an empty folder,
+    /// defeating per-folder agent isolation for new installs.
+    pub fn init_for_setup() {
+        // Only pin to CWD if no fork-state override is active and CWD isn't home.
+        if crate::daemon::fork_state::config_dir().is_none() {
+            let home = dirs::home_dir().unwrap_or_default();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
+            // Don't force ./.b3/ when already at home — home default is correct there.
+            if cwd != home {
+                // Force the lock to ./.b3/ before any other code calls config_dir().
+                let _ = CONFIG_DIR.set(cwd.join(".b3"));
+                return;
+            }
+        }
+        // Otherwise let normal resolution run.
+        let _ = CONFIG_DIR.set(Self::resolve_config_dir());
+    }
+
+    /// Path to main config file.
     pub fn config_path() -> PathBuf {
         Self::config_dir().join("config.json")
     }

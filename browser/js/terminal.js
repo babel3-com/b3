@@ -40,103 +40,6 @@ if (typeof WebLinksAddon !== 'undefined') {
 term.open(document.getElementById('xterm-wrap'));
 window._term = term;  // expose for debugging/testing
 
-// ── URL overlay ──
-// URLs that wrap across terminal rows can't be clicked or copy-pasted cleanly
-// (iOS Safari inserts %0A at line wraps). Scan the buffer for URLs spanning
-// wrapped rows and overlay a floating "Open" button next to each one.
-// Overlay is on #xterm-wrap (not inside .xterm) to avoid breaking xterm layout.
-(function() {
-    var wrap = document.getElementById('xterm-wrap');
-    var urlOverlay = document.createElement('div');
-    urlOverlay.id = 'url-overlay-container';
-    urlOverlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:50;overflow:hidden;';
-    wrap.style.position = 'relative';
-    wrap.appendChild(urlOverlay);
-
-    function detectUrls() {
-        var buf = term.buffer.active;
-        var cols = term.cols;
-        var viewportY = buf.viewportY;
-        var rows = term.rows;
-        urlOverlay.innerHTML = '';
-
-        // Read all visible rows
-        var rawRows = [];
-        for (var i = 0; i < rows; i++) {
-            var line = buf.getLine(viewportY + i);
-            if (!line) { rawRows.push({text: '', trimmed: '', wrapped: false}); continue; }
-            var text = '';
-            for (var j = 0; j < cols; j++) {
-                var cell = line.getCell(j);
-                text += cell ? cell.getChars() || ' ' : ' ';
-            }
-            var trimmed = text.replace(/\s+$/, '');
-            rawRows.push({text: text, trimmed: trimmed, wrapped: line.isWrapped});
-        }
-
-        // Join lines into segments. A line continues the previous segment if:
-        // (a) isWrapped is true, OR
-        // (b) previous line was full (trimmed length >= cols-1) AND this line
-        //     starts with a non-space URL-like char (letter, digit, %, &, =, /, etc.)
-        //     This handles programs that explicitly write \n at column boundaries.
-        var segments = [];
-        var currentText = '';
-        var currentStartRow = 0;
-        for (var i = 0; i < rawRows.length; i++) {
-            var r = rawRows[i];
-            var shouldJoin = r.wrapped;
-            if (!shouldJoin && i > 0 && currentText.length > 0) {
-                var prevTrimLen = rawRows[i - 1].trimmed.length;
-                var firstChar = r.trimmed.charAt(0);
-                // Previous line full AND this line starts with URL-continuation char
-                if (prevTrimLen >= cols - 1 && firstChar && firstChar !== ' ' && /[a-zA-Z0-9%&=\/?._\-+~#]/.test(firstChar)) {
-                    shouldJoin = true;
-                }
-            }
-            if (shouldJoin) {
-                currentText += r.trimmed;
-            } else {
-                if (currentText) segments.push({text: currentText, startRow: currentStartRow});
-                currentText = r.trimmed;
-                currentStartRow = i;
-            }
-        }
-        if (currentText) segments.push({text: currentText, startRow: currentStartRow});
-
-        var urlRegex = /https?:\/\/[^\s]+/g;
-        var xtermScreen = document.querySelector('.xterm-screen');
-        if (!xtermScreen) return;
-        var rowH = xtermScreen.offsetHeight / rows;
-        var charW = xtermScreen.offsetWidth / cols;
-
-        segments.forEach(function(seg) {
-            var m;
-            while ((m = urlRegex.exec(seg.text)) !== null) {
-                var url = m[0].replace(/[\s)>\],.;:]+$/, ''); // trim trailing punct + spaces
-
-                var urlEndOffset = m.index + url.length;
-                var endRow = seg.startRow + Math.floor((urlEndOffset - 1) / cols);
-                var endCol = (urlEndOffset - 1) % cols + 1; // column after last URL char
-
-                var btn = document.createElement('a');
-                btn.href = url;
-                btn.target = '_blank';
-                btn.rel = 'noopener';
-                btn.textContent = '\u2197 Open';
-                // Position right after the URL's last character
-                var btnLeft = Math.min(endCol * charW + 4, xtermScreen.offsetWidth - 60);
-                btn.style.cssText = 'position:absolute;left:' + btnLeft + 'px;top:' + (endRow * rowH + 2) + 'px;' +
-                    'background:#1a7f37;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;' +
-                    'pointer-events:auto;text-decoration:none;z-index:51;font-family:system-ui,sans-serif;' +
-                    'line-height:1.4;box-shadow:0 1px 3px rgba(0,0,0,0.3);';
-                urlOverlay.appendChild(btn);
-            }
-        });
-    }
-
-    term.onRender(detectUrls);
-    term.onScroll(detectUrls);
-})();
 
 // ── Transcription overlay ──
 // Detects voice transcription lines in the terminal (prefixed by "← b3 · voice:")
@@ -292,8 +195,11 @@ window._term = term;  // expose for debugging/testing
             text = text.replace(/\s+$/, '');
 
             // ── Say play/pause/stop button ──
+            // Match either plugin-era "plugin:b3:b3 - say (MCP)" or direct-MCP "b3 - say (MCP)".
+            // The b3 MCP is the only namespace that ships our say tool, so matching "b3" + " - say (MCP)"
+            // on the same line is sufficient specificity.
             var sayIdx = text.indexOf(SAY_PREFIX);
-            if (sayIdx !== -1 && text.indexOf('b3:b3') !== -1) {
+            if (sayIdx !== -1 && /\bb3\b/.test(text.slice(0, sayIdx))) {
                 var textMatch = text.match(/text:\s*"([^"]*)/);
                 var sayText = textMatch ? textMatch[1] : '';
 
@@ -1022,12 +928,31 @@ if (_isIOS) {
 // ── End Virtual Keyboard Resize ──
 
 // ── Keyboard Input → Daemon PTY ──
+// Returns true if `data` is an xterm.js auto-reply that must NOT be forwarded
+// to the daemon PTY. These are terminal-protocol responses that xterm emits
+// automatically in reaction to capability queries in the replayed init buffer
+// (DA1 \e[c, DA2 \e[>0q, DSR \e[6n, OSC color/name queries). Forwarding them
+// injects garbage into readline (e.g. "1;2c" printed literally).
+function _isXtermAutoReply(data) {
+    // DA1 response: \x1b[?<n>;<m>c
+    if (/^\x1b\[\?[\d;]+c$/.test(data)) return true;
+    // DA2 response: \x1b[><n>;<m>;<p>c
+    if (/^\x1b\[>[\d;]+c$/.test(data)) return true;
+    // DSR/CPR cursor position report: \x1b[<row>;<col>R
+    if (/^\x1b\[\d+;\d+R$/.test(data)) return true;
+    // OSC responses: \x1b]...<BEL or ST>
+    if (/^\x1b\].*(\x07|\x1b\\)$/.test(data)) return true;
+    return false;
+}
+
 term.onData((data) => {
     if (data === '\x1b[I' || data === '\x1b[O') return;
     // Filter out SGR mouse wheel sequences — xterm generates these from touch/scroll
     // but Claude Code's PTY doesn't have mouse reporting, so they echo as raw text.
     // SGR format: \x1b[<64;...M (scroll up) or \x1b[<65;...M (scroll down)
     if (data.startsWith('\x1b[<6') && (data.includes('M') || data.includes('m'))) return;
+    // Filter xterm.js auto-replies to terminal capability queries in init buffer.
+    if (_isXtermAutoReply(data)) return;
     if (HC.ws && HC.ws.readyState === WebSocket.OPEN) {
         HC.ws.send(data);
     }
@@ -1235,17 +1160,34 @@ document.getElementById('file-upload-input').addEventListener('change', async fu
 // ── Terminal Key Strip ──
 const TERM_KEY_MAP = {
     'up': '\x1b[A', 'down': '\x1b[B', 'left': '\x1b[D', 'right': '\x1b[C',
-    'esc': '\x1b', 'ctrl-c': '\x03', 'ctrl-b': '\x02', 'ctrl-o': '\x0f',
-    'enter': '\r',
+    'esc': '\x1b', 'enter': '\r', 'tab': '\t',
+    'ctrl-a': '\x01', 'ctrl-b': '\x02', 'ctrl-c': '\x03', 'ctrl-d': '\x04',
+    'ctrl-e': '\x05', 'ctrl-f': '\x06', 'ctrl-k': '\x0b', 'ctrl-l': '\x0c',
+    'ctrl-n': '\x0e', 'ctrl-o': '\x0f', 'ctrl-p': '\x10', 'ctrl-r': '\x12',
+    'ctrl-u': '\x15', 'ctrl-w': '\x17', 'ctrl-x': '\x18', 'ctrl-z': '\x1a',
+    'page-up': '\x1b[5~', 'page-down': '\x1b[6~',
+    'home': '\x1b[H', 'end': '\x1b[F',
 };
-document.querySelectorAll('.term-key[data-seq]').forEach(btn => {
+
+// Fallback labels for the default active-row keys. Only needs entries that
+// appear in LAYOUT_DEFAULTS.term_keys — everything else comes from user-settings.
+HC.TERM_KEY_CATALOG = [
+    { seq: 'esc',   label: 'Esc',   wide: false },
+    { seq: 'ctrl-c',label: '^c',    wide: false },
+    { seq: 'ctrl-b',label: '^b',    wide: false },
+    { seq: 'ctrl-o',label: '^o',    wide: false },
+    { seq: 'left',  label: '◀',    wide: false },
+    { seq: 'right', label: '▶',    wide: false },
+    { seq: 'up',    label: '▲',    wide: false },
+    { seq: 'down',  label: '▼',    wide: false },
+    { seq: 'enter', label: 'Enter', wide: true  },
+];
+
+function _bindTermKey(btn) {
     function _sendTermKey() {
         const data = TERM_KEY_MAP[btn.dataset.seq] || btn.dataset.seq;
         if (HC.ws && HC.ws.readyState === WebSocket.OPEN) HC.ws.send(data);
     }
-    // On touch: preventDefault on touchstart prevents the button from stealing
-    // focus from the xterm textarea, which would dismiss the iOS keyboard.
-    // Key is sent on touchend. The click handler covers non-touch devices.
     btn.addEventListener('touchstart', (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -1259,7 +1201,11 @@ document.querySelectorAll('.term-key[data-seq]').forEach(btn => {
         e.preventDefault();
         _sendTermKey();
     });
-});
+}
+
+document.querySelectorAll('.term-key[data-seq]').forEach(_bindTermKey);
+HC.bindTermKey = _bindTermKey;
+HC.TERM_KEY_MAP = TERM_KEY_MAP;
 
 // ── Long-Press Copy/Paste (mobile-native feel) ──
 // Long press (500ms, <10px movement) on terminal → selection at that word.

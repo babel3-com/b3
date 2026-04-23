@@ -367,7 +367,9 @@ function reflowMcpBytes(data) {
 }
 
 // ── Daemon password authentication ──
-var _daemonPwCookieName = 'b3-daemon-pw-' + (typeof HC.config.agentName !== 'undefined' ? HC.config.agentName : 'default');
+// Use agentId from window.__HC__ (available synchronously) to key the cookie —
+// HC.config is not set until HC.ready resolves (after an async bootstrap fetch).
+var _daemonPwCookieName = 'b3-daemon-pw-' + ((window.__HC__ && window.__HC__.agentId) || 'default');
 var _daemonAuthPending = false;
 
 // Auto-auth from URL fragment: #pw=<password> (used by hosted session "Open" button)

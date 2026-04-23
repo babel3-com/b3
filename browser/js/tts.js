@@ -188,7 +188,9 @@ async function streamFromGpu(msg) {
 
     // Register voice job for reliability tracking
     const _vjId = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
-    HC.registerJob({ id: _vjId, agent_id: HC.config.agentId || '', job_type: 'tts', msg_id: msg_id, text_preview: (text || '').substring(0, 200), voice: voice });
+    // Awaited so the row exists before the first jobCheckpoint PATCH fires.
+    // gpuRun fires concurrently on the next line — audio path is not blocked.
+    await HC.registerJob({ id: _vjId, agent_id: HC.config.agentId || '', job_type: 'tts', msg_id: msg_id, text_preview: (text || '').substring(0, 200), voice: voice });
 
     // 1. Submit async job to GPU via gpuRun (local-first + RunPod fallback)
     const preferredVoice = localStorage.getItem('b3-voice-' + HC.config.agentId) || 'arabella-chase';

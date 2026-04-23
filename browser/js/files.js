@@ -35,7 +35,9 @@ function daemonFetch(path, opts) {
     return fetch(path, opts);
 }
 
-function openFilesPanel() {
+// openFilesPanel(path?) — optional path opens directly to a file or directory.
+// If path ends with a filename (not '/'), the parent dir is loaded and the file opened.
+function openFilesPanel(path) {
     var panel = document.getElementById('files-panel');
     if (!panel) return;
     panel.classList.add('open');
@@ -44,9 +46,25 @@ function openFilesPanel() {
     _filesViewingFile = false;
     _filesEditing = false;
     showFileTree();
-    loadFiles('.');
     loadShiki();
     loadCodeMirror();
+    if (path && path !== '.') {
+        // Navigate to the path — if it looks like a file (has extension or no trailing slash),
+        // load the parent dir then open the file.
+        // Heuristic: treat as file if path contains '.' and doesn't end with '/'.
+        // Good enough for the known callers (e.g. ~/.b3/term-keys.json).
+        var isFile = path.indexOf('.') !== -1 && !path.endsWith('/');
+        if (isFile) {
+            var lastSlash = path.lastIndexOf('/');
+            var dir = lastSlash > 0 ? path.slice(0, lastSlash) : '.';
+            var file = path.slice(lastSlash + 1);
+            loadFiles(dir, function() { openFile(file); });
+        } else {
+            loadFiles(path);
+        }
+    } else {
+        loadFiles('.');
+    }
 }
 
 function closeFilesPanel() {
@@ -80,7 +98,7 @@ function hideAllViewerPanes() {
     document.getElementById('files-save-btn').style.display = 'none';
 }
 
-function loadFiles(path) {
+function loadFiles(path, callback) {
     var tree = document.getElementById('files-tree');
     if (!HC.hasDaemonConnection()) {
         tree.innerHTML = '<div class="files-loading">Waiting for agent connection...</div>';
@@ -90,7 +108,8 @@ function loadFiles(path) {
     _filesCurrentPath = path;
     tree.innerHTML = '<div class="files-loading">Loading...</div>';
 
-    daemonFetch('/api/files?path=' + encodeURIComponent(path))
+    var url = '/api/files?path=' + encodeURIComponent(path) + '&hidden=true';
+    daemonFetch(url)
     .then(function(r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
@@ -102,9 +121,11 @@ function loadFiles(path) {
             document.getElementById('files-path-input').value = data.absolute;
         }
         renderFileList(data.entries || []);
+        if (typeof callback === 'function') callback();
     })
     .catch(function(e) { tree.innerHTML = '<div class="files-loading">Error: ' + (e.message || e) + '</div>'; });
 }
+
 
 function renderFileList(entries) {
     var tree = document.getElementById('files-tree');
@@ -158,6 +179,9 @@ function navigateBack() {
 
 function openFile(name) {
     if (!HC.hasDaemonConnection()) return;
+    var viewerName = document.getElementById('files-viewer-name');
+    var viewerMeta = document.getElementById('files-viewer-meta');
+    if (!viewerName || !viewerMeta) return;
     var filePath = _filesAbsolutePath ? _filesAbsolutePath + '/' + name : (_filesCurrentPath === '.' ? name : _filesCurrentPath + '/' + name);
     _filesCurrentFilePath = filePath;
     // Track file visit during recording
@@ -165,8 +189,8 @@ function openFile(name) {
         HC.trackFileVisit(filePath);
     }
 
-    document.getElementById('files-viewer-name').textContent = name;
-    document.getElementById('files-viewer-meta').textContent = 'Loading...';
+    viewerName.textContent = name;
+    viewerMeta.textContent = 'Loading...';
     hideAllViewerPanes();
     showFileViewer();
 
@@ -230,9 +254,12 @@ function openFile(name) {
         }
     })
     .catch(function(e) {
-        document.getElementById('files-viewer-meta').textContent = 'Error';
-        document.getElementById('files-viewer-content').style.display = '';
-        document.getElementById('files-code').textContent = e.message || String(e);
+        var m = document.getElementById('files-viewer-meta');
+        var c = document.getElementById('files-viewer-content');
+        var code = document.getElementById('files-code');
+        if (m) m.textContent = 'Error';
+        if (c) c.style.display = '';
+        if (code) code.textContent = e.message || String(e);
     });
 }
 

@@ -21,6 +21,10 @@ use crate::daemon::server;
 pub async fn run(cli_token: Option<String>, cli_name: Option<String>) -> anyhow::Result<()> {
     let non_interactive = cli_token.is_some();
 
+    // Pin config dir to CWD's .b3/ when outside $HOME (per-folder agent setup).
+    // Must run before any Config:: call so the OnceLock gets the right path.
+    Config::init_for_setup();
+
     if !non_interactive {
         println!();
         println!("  Babel3 Setup");
@@ -138,13 +142,14 @@ pub async fn run(cli_token: Option<String>, cli_name: Option<String>) -> anyhow:
 
     let reg: RegisterResponse = resp.json().await?;
 
-    // 6. Save config (api_url is public, used only for this initial registration;
-    //    all runtime comms go through the WireGuard mesh)
+    // 6. Save config
+    let auto_update = prompt_auto_update_preference();
     let config = Config {
         agent_id: reg.agent_id.clone(),
         agent_email: reg.agent_email.clone(),
         api_key: reg.api_key.clone(),
         api_url: api_url.clone(),
+        // Retained for config.json compatibility — no longer used for routing.
         wg_address: reg.wg_address.clone(),
         relay_endpoint: reg.relay_endpoint.clone(),
         relay_public_key: reg.relay_public_key.clone(),
@@ -152,10 +157,13 @@ pub async fn run(cli_token: Option<String>, cli_name: Option<String>) -> anyhow:
         web_url: reg.web_url.clone(),
         b3_version: env!("CARGO_PKG_VERSION").to_string(),
         servers: reg.servers.clone(),
+        auto_update,
     };
     config.save()?;
 
-    // 7. Save WG private key
+    // 7. Save WG private key — reused as this agent's X25519 identity key for
+    // hive ephemeral encryption (crypto/hive_integration.rs). Not used for
+    // WireGuard tunneling (mesh removed), but required for hive to work.
     let wg_dir = Config::config_dir().join("wg");
     std::fs::create_dir_all(&wg_dir)?;
     let key_path = wg_dir.join("private.key");
@@ -202,10 +210,12 @@ pub async fn run(cli_token: Option<String>, cli_name: Option<String>) -> anyhow:
         }
     }
 
-    // 8. Register Voice MCP with Claude Code + Codex
+    // 8. Register Voice MCP + install user-global skills + migrate from legacy plugin
     let b3_bin = find_b3_binary();
     let mcp_registered = register_voice_mcp(&b3_bin);
     let codex_registered = register_codex_mcp(&b3_bin);
+    let skills_installed = install_skills();
+    let plugin_migrated = uninstall_claude_plugin_if_present();
 
     // 8b. Append voice instructions to CLAUDE.md and AGENTS.md
     let claude_md_result = append_voice_instructions(&reg.agent_email, &reg.web_url);
@@ -218,10 +228,9 @@ pub async fn run(cli_token: Option<String>, cli_name: Option<String>) -> anyhow:
     println!();
     println!("    Identity:  {}", reg.agent_email);
     println!("    Agent ID:  {}", reg.agent_id);
-    println!("    Mesh IP:   {}", reg.wg_address);
     println!("    Dashboard: {}", reg.web_url);
     println!();
-    println!("  Config saved to ~/.b3/config.json");
+    println!("  Config saved to: {}", Config::config_path().display());
 
     match mcp_registered {
         Ok(path) => {
@@ -235,7 +244,7 @@ pub async fn run(cli_token: Option<String>, cli_name: Option<String>) -> anyhow:
             println!("      \"mcpServers\": {{");
             println!("        \"b3\": {{");
             println!("          \"command\": \"{}\",", b3_bin.display());
-            println!("          \"args\": [\"mcp\", \"voice\"]");
+            println!("          \"args\": [\"mcp\", \"serve\"]");
             println!("        }}");
             println!("      }}");
             println!("    }}");
@@ -251,6 +260,13 @@ pub async fn run(cli_token: Option<String>, cli_name: Option<String>) -> anyhow:
     match codex_registered {
         Ok(path) => println!("  Codex MCP registered in {}", path.display()),
         Err(_) => {} // Codex not installed — silent, not an error
+    }
+    match skills_installed {
+        Ok(path) => println!("  Skills installed to {}", path.display()),
+        Err(e) => eprintln!("  Note: Could not install skills: {e}"),
+    }
+    if plugin_migrated {
+        println!("  Migrated: legacy Claude Code plugin (b3@b3 / b3@b3-plugins) uninstalled");
     }
 
     println!("  ══════════════════════════════════════════");
@@ -436,8 +452,16 @@ pub fn register_voice_mcp(b3_bin: &PathBuf) -> anyhow::Result<PathBuf> {
         .cloned()
         .unwrap_or_else(|| json!({}));
     let mut entry = if existing.is_object() { existing } else { json!({}) };
+    // Pass config_dir and start_cwd as CLI args so the MCP subprocess (exec'd fresh
+    // by Claude Code) doesn't need B3_CONFIG_DIR or B3_START_CWD env vars.
+    let config_dir = crate::config::Config::config_dir();
+    let start_cwd = cwd.clone(); // cwd = current_dir() at top of this function
     entry["command"] = json!(b3_bin.to_string_lossy());
-    entry["args"] = json!(["mcp", "voice"]);
+    entry["args"] = json!([
+        "mcp", "serve",
+        "--config-dir", config_dir.to_string_lossy(),
+        "--start-cwd", start_cwd.to_string_lossy(),
+    ]);
     entry["_b3_version"] = json!(env!("CARGO_PKG_VERSION"));
     config["mcpServers"]["b3"] = entry;
 
@@ -470,7 +494,7 @@ pub fn register_codex_mcp(b3_bin: &PathBuf) -> anyhow::Result<PathBuf> {
     if content.contains("[mcp_servers.b3]") {
         // Update the command path in case the binary moved
         let new_section = format!(
-            "[mcp_servers.b3]\ncommand = \"{}\"\nargs = [\"mcp\", \"voice\"]\n",
+            "[mcp_servers.b3]\ncommand = \"{}\"\nargs = [\"mcp\", \"serve\"]\n",
             b3_bin.display()
         );
         // Replace the existing section
@@ -488,7 +512,7 @@ pub fn register_codex_mcp(b3_bin: &PathBuf) -> anyhow::Result<PathBuf> {
             content.push('\n');
         }
         content.push_str(&format!(
-            "\n[mcp_servers.b3]\ncommand = \"{}\"\nargs = [\"mcp\", \"voice\"]\n",
+            "\n[mcp_servers.b3]\ncommand = \"{}\"\nargs = [\"mcp\", \"serve\"]\n",
             b3_bin.display()
         ));
     }
@@ -532,4 +556,101 @@ fn append_agents_md_instructions(agent_name: &str, web_url: &str) -> anyhow::Res
     std::io::Write::write_all(&mut file, instructions.as_bytes())?;
 
     Ok(agents_md_path)
+}
+
+/// Install bundled skill files to the user's global Claude Code skills directory.
+/// Target: $HOME/.claude/skills/ — auto-discovered by Claude Code across all projects.
+/// Idempotent: overwrites b3-owned files, leaves other files untouched.
+pub fn install_skills() -> anyhow::Result<std::path::PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    let skills_root = home.join(".claude").join("skills");
+    crate::skills::install_to(&skills_root)?;
+    Ok(skills_root)
+}
+
+/// Uninstall any legacy Babel3 Claude Code plugin if present.
+/// Non-fatal — cleanup failures don't block setup.
+pub fn uninstall_claude_plugin_if_present() -> bool {
+    // Check if claude is on PATH before attempting plugin commands.
+    let claude_present = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !claude_present {
+        return false;
+    }
+    // Use .output() to capture stdout/stderr — .status() would let claude's own
+    // "✘ Failed to uninstall plugin ..." error messages leak into the terminal
+    // on every b3 update, even when the plugin was never installed (the expected
+    // case for most users).
+    let mut removed = false;
+    for plugin_ref in ["b3@b3", "b3@b3-plugins"] {
+        let output = std::process::Command::new("claude")
+            .args(["plugin", "uninstall", plugin_ref])
+            .output();
+        if matches!(&output, Ok(o) if o.status.success()) {
+            removed = true;
+        }
+    }
+    removed
+}
+
+/// Prompt user for auto-update preference. Returns false on non-interactive stdin.
+pub fn prompt_auto_update_preference() -> bool {
+    use std::io::{self, Write};
+    println!("  Auto-update checks for a new b3 version on every `b3 start` and");
+    println!("  installs it before launching the daemon. Adds a few seconds of");
+    println!("  startup latency; network failures are non-fatal.");
+    print!("  Check for updates on every `b3 start`? [y/N]: ");
+    let _ = io::stdout().flush();
+    let mut ans = String::new();
+    if io::stdin().read_line(&mut ans).is_err() {
+        return false;
+    }
+    matches!(ans.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Remove the stale `session-memory` entry from .mcp.json (if present and ours).
+/// Only removes entries whose command path ends in `b3` or equals `b3`.
+/// Non-fatal on any parse or I/O error.
+pub fn remove_legacy_session_memory_entry() {
+    let mcp_path = match std::env::current_dir() {
+        Ok(d) => d.join(".mcp.json"),
+        Err(_) => return,
+    };
+    if !mcp_path.exists() {
+        return;
+    }
+    let data = match std::fs::read_to_string(&mcp_path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let mut config: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let removed = if let Some(servers) = config.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+        if let Some(entry) = servers.get("session-memory") {
+            // Only remove if command is our binary — don't touch user-owned registrations
+            let is_ours = entry.get("command")
+                .and_then(|v| v.as_str())
+                .map(|cmd| cmd == "b3" || cmd.ends_with("/b3") || cmd.ends_with("\\b3") || cmd.ends_with("\\b3.exe"))
+                .unwrap_or(false);
+            if is_ours {
+                servers.remove("session-memory");
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if removed {
+        if let Ok(json_str) = serde_json::to_string_pretty(&config) {
+            let _ = std::fs::write(&mcp_path, json_str);
+        }
+    }
 }

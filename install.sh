@@ -137,31 +137,6 @@ verify_install() {
     info "Installed ${BINARY} to ${INSTALL_DIR}/${BINARY}"
 }
 
-# --- plugin installation ---
-
-B3_MARKETPLACE="${B3_MARKETPLACE:-babel3-com/b3-plugins}"
-
-install_plugin() {
-    if command -v claude > /dev/null 2>&1; then
-        info "Registering Babel3 plugin marketplace (GitHub: https://github.com/${B3_MARKETPLACE})..."
-        if ! claude plugin marketplace add "$B3_MARKETPLACE" 2>&1; then
-            warn "Marketplace registration failed. Install manually later:"
-            warn "  claude plugin marketplace add ${B3_MARKETPLACE}"
-        else
-            info "Installing B3 plugin (voice, hive, codebase skill)..."
-            if ! claude plugin install "b3@$(echo "$B3_MARKETPLACE" | sed 's|.*/||')" 2>&1; then
-                warn "Plugin install failed. Install manually later:"
-                warn "  claude plugin install b3@b3-plugins"
-            fi
-        fi
-    else
-        warn "Claude Code not found — skipping plugin installation."
-        warn "Install Claude Code, then run:"
-        warn "  claude plugin marketplace add ${B3_MARKETPLACE}"
-        warn "  claude plugin install b3@b3-plugins"
-    fi
-}
-
 # --- main ---
 
 main() {
@@ -177,13 +152,6 @@ main() {
         # Binary installed to ~/.local/bin but not yet in PATH for this shell
         export PATH="${HOME}/.local/bin:${PATH}"
     fi
-
-    # --- register marketplace and install plugin (skip with --no-plugins) ---
-
-    case "${1:-}" in
-        --no-plugins) info "Skipping plugin installation (--no-plugins)" ;;
-        *) install_plugin ;;
-    esac
 
     if command -v "$BINARY" > /dev/null 2>&1; then
         info "Installed. Starting Babel3..."

@@ -418,7 +418,7 @@ fn message_role(data: &Value) -> Option<&str> {
 // Tool: find_active_session
 // ---------------------------------------------------------------------------
 
-fn handle_find_active_session(_args: &Value) -> Value {
+pub fn handle_find_active_session(_args: &Value) -> Value {
     let dirs = get_all_session_dirs();
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
 
@@ -457,7 +457,7 @@ fn handle_find_active_session(_args: &Value) -> Value {
 // Tool: get_session_info
 // ---------------------------------------------------------------------------
 
-fn handle_get_session_info(args: &Value) -> Value {
+pub fn handle_get_session_info(args: &Value) -> Value {
     let path = match resolve_session_path(args) {
         Ok(p) => p,
         Err(e) => return json!({"error": e}),
@@ -484,7 +484,7 @@ fn handle_get_session_info(args: &Value) -> Value {
 // Tool: list_sessions
 // ---------------------------------------------------------------------------
 
-fn handle_list_sessions(args: &Value) -> Value {
+pub fn handle_list_sessions(args: &Value) -> Value {
     let min_size_mb = args.get("min_size_mb").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     let after = args.get("after").and_then(|v| v.as_str()).unwrap_or("");
@@ -627,7 +627,7 @@ fn read_last_timestamp(path: &Path, meta: &fs::Metadata) -> Option<String> {
 // Tool: resurface
 // ---------------------------------------------------------------------------
 
-fn handle_resurface(args: &Value) -> Value {
+pub fn handle_resurface(args: &Value) -> Value {
     let start_line = args.get("start_line").and_then(|v| v.as_i64()).unwrap_or(1);
     let end_line = args.get("end_line").and_then(|v| v.as_i64()).unwrap_or(-1);
     let include_timestamps = args.get("include_timestamps").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -1116,7 +1116,7 @@ fn read_line_range(
 // Tool: add_session_dir
 // ---------------------------------------------------------------------------
 
-fn handle_add_session_dir(args: &Value) -> Value {
+pub fn handle_add_session_dir(args: &Value) -> Value {
     let dir = match args.get("dir").and_then(|v| v.as_str()) {
         Some(d) if !d.is_empty() => d,
         _ => return tool_error("'dir' parameter is required"),

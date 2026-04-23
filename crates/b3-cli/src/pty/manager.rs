@@ -65,11 +65,10 @@ impl PtyManager {
         for arg in args {
             cmd.arg(arg);
         }
-        // Set working directory: use B3_START_CWD (saved at `b3 start` time),
+        // Set working directory: use fork_state start_cwd (set at `b3 start` time),
         // fall back to current process cwd. Without this, portable-pty defaults to $HOME.
-        if let Ok(start_cwd) = std::env::var("B3_START_CWD") {
-            let p = std::path::Path::new(&start_cwd);
-            if p.is_dir() {
+        if let Some(start_cwd) = crate::daemon::fork_state::start_cwd() {
+            if start_cwd.is_dir() {
                 cmd.cwd(start_cwd);
             }
         } else if let Ok(cwd) = std::env::current_dir() {
@@ -161,6 +160,12 @@ impl PtyManager {
             pixel_height: 0,
         })?;
         Ok(())
+    }
+
+    /// Inject bytes directly into the PTY output broadcast (as if the process wrote them).
+    /// Used to prepend the startup banner so browser terminals see it in the session buffer.
+    pub fn inject_output(&self, data: Vec<u8>) {
+        let _ = self.output_tx.send(data);
     }
 
     /// Get a clonable resize handle for use from async tasks.

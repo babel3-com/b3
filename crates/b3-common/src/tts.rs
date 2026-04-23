@@ -375,10 +375,10 @@ mod tests {
 
     #[test]
     fn test_build_tts_payload() {
-        let payload = build_tts_payload("Hello world", "arabella", "msg-123", "", ".!?", 80);
+        let payload = build_tts_payload("Hello world", "arabella-chase", "msg-123", "", ".!?", 80);
         assert_eq!(payload["action"], "synthesize_stream");
         assert_eq!(payload["text"], "Hello world");
-        assert_eq!(payload["voice"], "arabella");
+        assert_eq!(payload["voice"], "arabella-chase");
         assert_eq!(payload["msg_id"], "msg-123");
         assert_eq!(payload["temperature"], DEFAULT_TEMPERATURE);
         assert!(payload.get("conditionals_b64").is_none());
@@ -465,7 +465,7 @@ mod tests {
             msg_id: "abc".to_string(),
             text: "Hello world".to_string(),
             original_text: "**Hello** world".to_string(),
-            voice: "arabella".to_string(),
+            voice: "arabella-chase".to_string(),
             emotion: "warm".to_string(),
             replying_to: "user said something".to_string(),
             timestamp: 1741654321,

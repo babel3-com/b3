@@ -2,6 +2,15 @@
 //!
 //! Connects to the daemon socket and sends a Stop message.
 //! The daemon will kill the PTY, close the tunnel, and exit.
+//!
+//! Service lifecycle design:
+//! - `b3 stop`      → stops daemon AND deregisters boot service. After reboot, b3 stays dead.
+//! - `b3 start`     → starts daemon AND registers boot service. After reboot, b3 comes back.
+//! - `b3 uninstall` → nuclear option, removes everything including config.
+//!
+//! systemd Restart=on-failure compatibility: the daemon calls std::process::exit(0)
+//! on clean stop (server.rs), so systemd will NOT restart it after `b3 stop`.
+//! Restart only fires on non-zero exit (crash/OOM), which is the intended behavior.
 
 use crate::daemon::ipc::IpcStream;
 use crate::daemon::protocol::{self, Message};
@@ -27,6 +36,9 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
         // Clean up stale files just in case
         crate::daemon::ipc::cleanup_endpoint();
         let _ = std::fs::remove_file(server::pid_path());
+        if let Err(e) = crate::service::uninstall() {
+            tracing::debug!("service uninstall: {e}");
+        }
         return Ok(());
     }
 
@@ -40,6 +52,9 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
             }
         }
         let _ = std::fs::remove_file(server::pid_path());
+        if let Err(e) = crate::service::uninstall() {
+            tracing::debug!("service uninstall: {e}");
+        }
         return Ok(());
     }
 
@@ -55,6 +70,9 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 if !server::is_running() {
                     println!("Daemon stopped.");
+                    if let Err(e) = crate::service::uninstall() {
+                        tracing::debug!("service uninstall: {e}");
+                    }
                     return Ok(());
                 }
             }
@@ -82,12 +100,19 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
             let _ = std::fs::remove_file(server::pid_path());
             crate::daemon::ipc::cleanup_endpoint();
             println!("Daemon stopped.");
+            if let Err(e) = crate::service::uninstall() {
+                tracing::debug!("service uninstall: {e}");
+            }
         }
         Err(e) => {
             println!("Could not connect to daemon: {e}");
             println!("Cleaning up stale files...");
             crate::daemon::ipc::cleanup_endpoint();
             let _ = std::fs::remove_file(server::pid_path());
+            // Do NOT deregister the service here — IPC failure doesn't mean the
+            // daemon is stopped (it may be alive but temporarily unreachable).
+            // Removing boot persistence when we don't know if stop succeeded
+            // would leave the user with no daemon and no auto-restart.
         }
     }
 

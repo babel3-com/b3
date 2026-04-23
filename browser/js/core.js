@@ -172,18 +172,51 @@ HC.rtcEnabled = function() {
     return HC.transportMode !== 'ws';
 };
 
-/* ── Config (injected by server into <script> block) ── */
-(function() {
+/* ── Config ── */
+HC.EC2_BASE = window.location.origin;
+
+// HC.ready resolves when HC.config is fully populated.
+// If window.__HC__ has a bootstrapUrl, fetch from the server first.
+// If window.__HC__ already has direct fields (old cached page or daemon mode),
+// bootstrapUrl is absent and we populate HC.config synchronously from cfg.
+HC.ready = (async function() {
     var cfg = window.__HC__ || {};
+    if (cfg.bootstrapUrl) {
+        var url = cfg.bootstrapUrl;
+        // Derive agent name from URL path when using bare '/api/bootstrap'.
+        // Matches /a/:name and /app/a/:name/* (forward-compat with PR 2).
+        if (url === '/api/bootstrap') {
+            // Match /a/:parent/:child or /a/:name (also /app/a/... variants).
+            // Two-segment match: m[1]=parent, m[2]=child (child must not contain '.' — guards against manifest.json).
+            var m = window.location.pathname.match(/^\/a(?:pp\/a)?\/([^\/]+)\/([^\/\.]+)$/);
+            if (m) {
+                url = '/api/bootstrap/' + encodeURIComponent(m[1]) + '/' + encodeURIComponent(m[2]);
+            } else {
+                var m1 = window.location.pathname.match(/^\/a(?:pp\/a)?\/([^\/]+)/);
+                if (m1) url = '/api/bootstrap/' + encodeURIComponent(m1[1]);
+            }
+        }
+        try {
+            var r = await fetch(url, { credentials: 'include' });
+            if (!r.ok) throw new Error('bootstrap HTTP ' + r.status);
+            var data = await r.json();
+            cfg = Object.assign({}, cfg, data);
+        } catch(e) {
+            console.error('[HC] Bootstrap failed:', e);
+            document.body.innerHTML = '<div style="color:#f85149;padding:2rem;font-family:monospace;">Dashboard bootstrap failed. <a href="/login" style="color:#58a6ff">Log in</a> and refresh.</div>';
+            throw e;
+        }
+    }
     HC.config = {
         agentName:       cfg.agentName       || '',
         agentId:         cfg.agentId         || '',
+        agentEmail:      cfg.agentEmail      || '',
         daemonToken:     cfg.daemonToken     || '',
         hostedSessionId: cfg.hostedSessionId || '',
         version:         cfg.version         || '0.0.0',
         domain:          cfg.domain          || window.location.hostname,
     };
-    HC.EC2_BASE = window.location.origin;
+    return HC.config;
 })();
 
 /* ── Math utilities ── */
@@ -244,7 +277,9 @@ HC.daemonFetch = function(path, options) {
 
 /**
  * Register a new voice job with EC2 for tracking.
- * Fire-and-forget — doesn't block the audio path.
+ * Returns a Promise — callers should await before firing the first jobCheckpoint
+ * so the row exists when the PATCH arrives. gpuRun fires concurrently on the
+ * next line, so the audio path is not blocked.
  * @param {Object} job - { id, agent_id, job_type, msg_id?, text_preview?, voice?, duration_sec? }
  * @returns {Promise<string>} job ID
  */

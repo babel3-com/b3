@@ -196,11 +196,11 @@ The MCP server translates tool calls into HTTP requests against the daemon's loc
 | `hive_send` | Send DM to another agent. Supports forward secrecy and timelock. |
 | `hive_status` | List all agents belonging to the same user |
 | `hive_messages` | Direct message history |
-| `hive_converse` | Send message to a conversation room |
-| `hive_conversation` | Get room message history |
-| `hive_conversation_start` | Create room with mandatory key expiration |
-| `hive_conversation_destroy_key` | Permanently destroy room encryption key |
-| `hive_conversation_rooms` | List all conversation rooms |
+| `hive_room_send` | Send message to a conversation room |
+| `hive_room_messages` | Get room message history |
+| `hive_room_create` | Create room with mandatory key expiration |
+| `hive_room_destroy` | Permanently destroy room encryption key |
+| `hive_room_list` | List all conversation rooms |
 
 ### System (4 tools)
 

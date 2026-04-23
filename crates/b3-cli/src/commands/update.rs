@@ -40,7 +40,18 @@ fn version_url() -> String {
 
 
 /// Manual update: user runs `b3 update`.
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run(force: bool) -> anyhow::Result<()> {
+    run_inner(&[], force).await
+}
+
+/// Called from `b3 start` auto-update path. On binary replacement, exec's into
+/// `<new_bin> install-skills --and-start <start_args>` so the daemon launches
+/// from the new binary after skills are refreshed.
+pub async fn run_with_start_chain(start_args: &[String]) -> anyhow::Result<()> {
+    run_inner(start_args, false).await
+}
+
+async fn run_inner(and_start: &[String], force: bool) -> anyhow::Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     println!("  Babel3 Update");
     println!("  ==============");
@@ -67,9 +78,26 @@ pub async fn run() -> anyhow::Result<()> {
         .or_else(|| version_info.get("version").and_then(|v| v.as_str()))
         .ok_or_else(|| anyhow::anyhow!("Invalid version.json: missing version for {platform}"))?;
 
-    // 2. Compare versions
-    if latest == current {
+    // 2. Compare versions — skip download when already current unless --force
+    if latest == current && !force {
         println!("  Already up to date ({current}).");
+        println!("  Run `b3 update --force` to re-run install-skills and plugin migration.");
+        return Ok(());
+    }
+
+    if latest == current {
+        // --force with current binary: skip download, just re-run install-skills.
+        println!("  Already up to date ({current}) — running install-skills (--force).");
+        let _ = crate::commands::setup::uninstall_claude_plugin_if_present();
+        crate::commands::setup::remove_legacy_session_memory_entry();
+        let b3_bin = crate::commands::setup::find_b3_binary();
+        match crate::commands::setup::install_skills() {
+            Ok(path) => println!("  Skills refreshed at {}", path.display()),
+            Err(e) => println!("  ⚠ Could not refresh skills: {e}"),
+        }
+        if let Err(e) = crate::commands::setup::register_voice_mcp(&b3_bin) {
+            println!("  ⚠ Could not refresh .mcp.json: {e}");
+        }
         return Ok(());
     }
 
@@ -166,6 +194,34 @@ pub async fn run() -> anyhow::Result<()> {
 
     println!();
     println!("  ✓ Updated to {latest}");
+
+    // Re-exec into the new binary's install-skills subcommand so the extracted
+    // skills come from the new binary, not the old in-memory image.
+    // When called from `b3 start --auto-update`, pass --and-start <args> so
+    // install-skills chains into `b3 start` after refreshing skills.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(&current_exe);
+        cmd.arg("install-skills");
+        if !and_start.is_empty() {
+            cmd.arg("--and-start");
+            cmd.args(and_start);
+        }
+        let err = cmd.exec();
+        eprintln!("  ⚠ Could not exec new binary for skill refresh: {err}");
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new(&current_exe);
+        cmd.arg("install-skills");
+        if !and_start.is_empty() {
+            cmd.arg("--and-start");
+            cmd.args(and_start);
+        }
+        let _ = cmd.spawn();
+    }
+
     println!("  Restart any running daemon with: b3 stop && b3 start");
     println!();
 

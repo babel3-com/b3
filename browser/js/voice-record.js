@@ -2551,7 +2551,9 @@ async function _doGpuTranscribe(seq, audioBlob, durSec, avgEnergy) {
 
         // Register voice job for reliability tracking
         const _vjId = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
-        HC.registerJob({ id: _vjId, agent_id: HC.config.agentId || '', job_type: 'stt', duration_sec: parseFloat(durSec) || 0 });
+        // Awaited so the row exists before the first jobCheckpoint PATCH fires.
+        // gpuRun fires on the next line — audio path is not blocked.
+        await HC.registerJob({ id: _vjId, agent_id: HC.config.agentId || '', job_type: 'stt', duration_sec: parseFloat(durSec) || 0 });
 
         // Submit async job via gpuRun (local-first + RunPod fallback)
         const sttT0 = performance.now();

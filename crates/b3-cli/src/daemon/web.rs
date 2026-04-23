@@ -565,6 +565,12 @@ pub struct WebState {
     /// Channel events broadcast — the voice MCP process subscribes via SSE to
     /// receive transcriptions (and future channel-bound events) without PTY injection.
     pub channel_events: broadcast::Sender<ChannelEvent>,
+    /// Local port for the app proxy (--app-port flag). When set, /app/a/:agent/* requests
+    /// forwarded from EC2 are proxied to http://127.0.0.1:{app_port}{path}.
+    pub app_port: Option<u16>,
+    /// Whether the app proxy is open to unauthenticated visitors (--app-public flag).
+    /// Reflected in the daemon register frame so EC2 can enforce auth at the proxy.
+    pub app_public: bool,
 }
 
 /// Events delivered to the MCP process via the channel-events SSE endpoint.
@@ -691,6 +697,21 @@ async fn health(State(state): State<WebState>) -> (StatusCode, axum::response::J
         None => (StatusCode::OK, serde_json::json!({ "status": "ok" })),
     };
     (status_code, axum::response::Json(body))
+}
+
+/// GET /api/bootstrap — runtime config for the browser dashboard.
+/// Returns the same shape as the server's /api/bootstrap/:agent_name.
+/// Lives behind auth_middleware (agent API key required).
+async fn daemon_bootstrap(State(state): State<WebState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "agentId": state.agent_id,
+        "agentName": state.agent_name,
+        "agentEmail": state.agent_email,
+        "daemonToken": state.api_key,
+        "hostedSessionId": "",
+        "domain": state.server_domain,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 /// GET /api/browser-console — return recent browser console log entries.
@@ -1062,9 +1083,18 @@ async fn write_file(
         home.join(raw_path)
     };
 
-    // Only allow writing to existing files (no creation via this endpoint)
+    // Allow creation only within ~/.b3/ — reject creation elsewhere
     if !full_path.exists() {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "file does not exist"})));
+        let b3_dir = home.join(".b3");
+        if !full_path.starts_with(&b3_dir) {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "file does not exist"})));
+        }
+        // Create parent dirs if needed (within .b3 only)
+        if let Some(parent) = full_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("mkdir failed: {}", e)})));
+            }
+        }
     }
 
     match tokio::fs::write(&full_path, content.as_bytes()).await {
@@ -2510,7 +2540,7 @@ async fn daemon_generate_and_archive(
                 tracing::info!(voice = %v, "Resolved agent voice from EC2");
                 v
             }
-            None => "arabella".to_string(),
+            None => "arabella-chase".to_string(),
         }
     } else {
         voice
@@ -4252,6 +4282,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/hive/rooms/:id/destroy-key", axum::routing::post(hive_room_destroy_key))
         .route("/api/update-status", get(update_status))
         .route("/api/restart", axum::routing::post(restart_daemon))
+        .route("/api/bootstrap", get(daemon_bootstrap))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         .fallback_service(site_service)
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB

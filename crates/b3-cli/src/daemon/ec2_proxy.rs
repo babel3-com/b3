@@ -104,8 +104,10 @@ pub fn spawn_multi_server_registration(
             "[EC2Proxy] Starting multi-server registration manager"
         );
 
-        // Peer shutdown sender — dropping it causes all peer loops to exit.
+        // Peer shutdown sender — dropping it signals peer loops to exit cooperatively.
+        // peer_handles: hard-abort fallback for loops blocked inside run_tunnel_client.
         let mut peer_shutdown_tx: Option<tokio::sync::watch::Sender<bool>> = None;
+        let mut peer_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         let mut backoff = Duration::from_secs(1);
 
@@ -157,6 +159,8 @@ pub fn spawn_multi_server_registration(
                     .encode(PublicKey::from(&StaticSecret::from(secret_bytes)).as_bytes()),
                 "lan_port": lan_port,
                 "multi_server": true,
+                "app_enabled": state.app_port.is_some(),
+                "app_public": state.app_public,
             }).to_string();
 
             if control_tx.send(Message::Text(reg_frame)).await.is_err() {
@@ -165,14 +169,18 @@ pub fn spawn_multi_server_registration(
             }
 
             // ── Shut down stale peer loops, spawn fresh ones ────────────
-            // Drop the old sender first — that signals all peer loops to exit.
+            // Signal cooperative shutdown first, then hard-abort any loop still blocked
+            // inside run_tunnel_client (a dropped JoinHandle detaches, not cancels).
             drop(peer_shutdown_tx.take());
+            for h in peer_handles.drain(..) {
+                h.abort();
+            }
 
             if server_urls.len() > 1 {
                 let (shutdown_tx, _) = tokio::sync::watch::channel(false);
                 for peer_url in server_urls.iter().skip(1) {
                     let peer_domain = url_to_domain(peer_url);
-                    spawn_ec2_registration(
+                    let handle = spawn_ec2_registration(
                         peer_domain,
                         agent_id.clone(),
                         api_key.clone(),
@@ -183,6 +191,7 @@ pub fn spawn_multi_server_registration(
                         state.clone(),
                         Some(shutdown_tx.subscribe()),
                     );
+                    peer_handles.push(handle);
                 }
                 peer_shutdown_tx = Some(shutdown_tx);
                 tracing::info!(
@@ -378,6 +387,8 @@ fn spawn_ec2_registration(
                 "pubkey": &pubkey_b64,
                 "lan_port": lan_port,
                 "multi_server": true,
+                "app_enabled": state.app_port.is_some(),
+                "app_public": state.app_public,
             }).to_string();
 
             if control_tx.send(Message::Text(reg_frame)).await.is_err() {
@@ -525,7 +536,7 @@ async fn run_daemon_session(
                 match msg {
                     Some(Ok(Message::Text(t))) => {
                         let just_ready = handle_ec2_frame(
-                            &agent_id, &session_id, web_port, &proxy_token, &api_key,
+                            &agent_id, &session_id, web_port, &proxy_token, &api_key, state.app_port,
                             t.as_bytes(), &mut enc, &mut local_ws_tx,
                             &to_ec2_tx, &local_to_enc_tx, &http_resp_tx, &http_client,
                         ).await;
@@ -535,7 +546,7 @@ async fn run_daemon_session(
                     }
                     Some(Ok(Message::Binary(b))) => {
                         let just_ready = handle_ec2_frame(
-                            &agent_id, &session_id, web_port, &proxy_token, &api_key,
+                            &agent_id, &session_id, web_port, &proxy_token, &api_key, state.app_port,
                             &b, &mut enc, &mut local_ws_tx,
                             &to_ec2_tx, &local_to_enc_tx, &http_resp_tx, &http_client,
                         ).await;
@@ -714,6 +725,7 @@ async fn handle_ec2_frame(
     web_port: u16,
     proxy_token: &str,
     api_key: &str,
+    app_port: Option<u16>,
     data: &[u8],
     enc: &mut EncryptedChannel,
     local_ws_tx: &mut Option<
@@ -784,6 +796,106 @@ async fn handle_ec2_frame(
                 return false;
             }
         };
+        // Raw HTTP-over-WS (app proxy sessions): server sends http_request as the first
+        // frame — no ECDH handshake. Response MUST go via to_ec2_tx (raw text); sending
+        // via http_resp_tx would route through enc.send() → encrypted binary, which the
+        // server cannot parse as JSON.
+        if v.get("type").and_then(|t| t.as_str()) == Some("http_request") {
+            let req_id = v.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let method  = v.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
+            let path    = v.get("path").and_then(|v| v.as_str()).unwrap_or("/").to_string();
+            let target  = v.get("target").and_then(|v| v.as_str()).unwrap_or("api").to_string();
+            let body_raw = v.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            let body_encoding = v.get("body_encoding").and_then(|v| v.as_str()).unwrap_or("");
+            let body_bytes: Vec<u8> = if body_encoding == "base64" {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.decode(body_raw).unwrap_or_default()
+            } else {
+                body_raw.as_bytes().to_vec()
+            };
+            let content_type = v
+                .get("headers")
+                .and_then(|h| h.get("content-type").or_else(|| h.get("Content-Type")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+
+            let target_port = match target.as_str() {
+                "app" => match app_port {
+                    Some(port) => port,
+                    None => {
+                        tracing::warn!(agent_id, session_id, "[EC2Proxy] Raw HTTP-over-WS: app proxy not enabled");
+                        let resp = serde_json::json!({
+                            "type": "http_response",
+                            "id": req_id,
+                            "status": 503,
+                            "body": "{\"error\":\"app proxy not enabled\"}",
+                        }).to_string();
+                        let _ = to_ec2_tx.try_send(resp.into_bytes());
+                        return false;
+                    }
+                },
+                _ => {
+                    tracing::warn!(agent_id, session_id, target, "[EC2Proxy] Raw HTTP-over-WS: unsupported target");
+                    let resp = serde_json::json!({
+                        "type": "http_response",
+                        "id": req_id,
+                        "status": 400,
+                        "body": "{\"error\":\"unsupported target for raw session\"}",
+                    }).to_string();
+                    let _ = to_ec2_tx.try_send(resp.into_bytes());
+                    return false;
+                }
+            };
+
+            tracing::info!(agent_id, session_id, method, path, target, "[EC2Proxy] Raw HTTP-over-WS request (app proxy)");
+
+            let url = format!("http://127.0.0.1:{}{}", target_port, path);
+            let resp_tx = to_ec2_tx.clone();
+            let client = http_client.clone();
+            tokio::spawn(async move {
+                let builder = match method.as_str() {
+                    "POST"   => client.post(&url).header("Content-Type", &content_type).body(body_bytes),
+                    "PUT"    => client.put(&url).header("Content-Type", &content_type).body(body_bytes),
+                    "PATCH"  => client.patch(&url).header("Content-Type", &content_type).body(body_bytes),
+                    "DELETE" => client.delete(&url).body(body_bytes),
+                    _        => client.get(&url),
+                };
+
+                let (status, resp_body, resp_encoding, resp_content_type) = match builder.send().await {
+                    Ok(r) => {
+                        let s = r.status().as_u16();
+                        let ct = r.headers()
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("application/octet-stream")
+                            .to_string();
+                        use base64::Engine as _;
+                        let (b, enc) = match r.bytes().await {
+                            Ok(bytes) => (base64::engine::general_purpose::STANDARD.encode(&bytes), "base64"),
+                            Err(_) => (String::new(), "base64"),
+                        };
+                        (s, b, enc, ct)
+                    }
+                    Err(e) => {
+                        tracing::warn!("[EC2Proxy] Raw HTTP-over-WS reqwest error: {e}");
+                        (502u16, format!("{{\"error\":\"{e}\"}}"), "", "application/json".to_string())
+                    }
+                };
+
+                let resp_frame = serde_json::json!({
+                    "type": "http_response",
+                    "id": req_id,
+                    "status": status,
+                    "body": resp_body,
+                    "body_encoding": resp_encoding,
+                    "content_type": resp_content_type,
+                }).to_string();
+                let _ = resp_tx.send(resp_frame.into_bytes()).await;
+            });
+            return false;
+        }
+
         if v.get("type").and_then(|t| t.as_str()) != Some("handshake") {
             tracing::warn!(agent_id, session_id, "[EC2Proxy] Expected handshake frame, got type={:?}", v.get("type"));
             return false;
@@ -829,66 +941,100 @@ async fn handle_ec2_frame(
                 let req_id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let method  = req.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
                 let path    = req.get("path").and_then(|v| v.as_str()).unwrap_or("/").to_string();
-                let body    = req.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let body_raw = req.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                let body_encoding = req.get("body_encoding").and_then(|v| v.as_str()).unwrap_or("");
+                let body_bytes: Vec<u8> = if body_encoding == "base64" {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.decode(body_raw).unwrap_or_default()
+                } else {
+                    body_raw.as_bytes().to_vec()
+                };
                 let content_type = req
-                    .get("headers").and_then(|h| h.get("Content-Type")).and_then(|v| v.as_str())
-                    .unwrap_or("application/json").to_string();
+                    .get("headers")
+                    .and_then(|h| h.get("content-type").or_else(|| h.get("Content-Type")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
 
-                // Restrict to /api/ paths — no arbitrary local access.
-                if !path.starts_with("/api/") {
-                    tracing::warn!(agent_id, session_id, path, "[EC2Proxy] HTTP-over-WS: forbidden path");
-                    let resp = serde_json::json!({
-                        "type": "http_response",
-                        "id": req_id,
-                        "status": 403,
-                        "body": "{\"error\":\"forbidden\"}",
-                    }).to_string();
-                    let _ = http_resp_tx.try_send(resp.into_bytes());
-                    continue;
-                }
+                let target = req.get("target").and_then(|v| v.as_str()).unwrap_or("api").to_string();
 
-                tracing::info!(agent_id, session_id, method, path, "[EC2Proxy] HTTP-over-WS request");
+                let (target_port, inject_auth) = match target.as_str() {
+                    "app" => {
+                        match app_port {
+                            Some(port) => (port, false),
+                            None => {
+                                tracing::warn!(agent_id, session_id, "[EC2Proxy] HTTP-over-WS: app proxy not enabled");
+                                let resp = serde_json::json!({
+                                    "type": "http_response",
+                                    "id": req_id,
+                                    "status": 404,
+                                    "body": "{\"error\":\"app proxy not enabled\"}",
+                                }).to_string();
+                                let _ = http_resp_tx.try_send(resp.into_bytes());
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Default "api" target — restrict to /api/ paths only.
+                        if !path.starts_with("/api/") {
+                            tracing::warn!(agent_id, session_id, path, "[EC2Proxy] HTTP-over-WS: forbidden path");
+                            let resp = serde_json::json!({
+                                "type": "http_response",
+                                "id": req_id,
+                                "status": 403,
+                                "body": "{\"error\":\"forbidden\"}",
+                            }).to_string();
+                            let _ = http_resp_tx.try_send(resp.into_bytes());
+                            continue;
+                        }
+                        (web_port, true)
+                    }
+                };
 
-                let url = format!("http://127.0.0.1:{}{}", web_port, path);
+                tracing::info!(agent_id, session_id, method, path, target, "[EC2Proxy] HTTP-over-WS request");
+
+                let url = format!("http://127.0.0.1:{}{}", target_port, path);
                 let api_key_owned = api_key.to_string();
                 let resp_tx = http_resp_tx.clone();
                 let client = http_client.clone();
 
                 tokio::spawn(async move {
                     let builder = match method.as_str() {
-                        "POST"   => client.post(&url).header("Content-Type", &content_type).body(body),
-                        "PUT"    => client.put(&url).header("Content-Type", &content_type).body(body),
-                        "PATCH"  => client.patch(&url).header("Content-Type", &content_type).body(body),
-                        "DELETE" => client.delete(&url).body(body),
+                        "POST"   => client.post(&url).header("Content-Type", &content_type).body(body_bytes),
+                        "PUT"    => client.put(&url).header("Content-Type", &content_type).body(body_bytes),
+                        "PATCH"  => client.patch(&url).header("Content-Type", &content_type).body(body_bytes),
+                        "DELETE" => client.delete(&url).body(body_bytes),
                         _        => client.get(&url),
                     };
-                    let builder = builder.header("Authorization", format!("Bearer {api_key_owned}"));
+                    // Inject agent API key only for /api/ requests to the daemon's own web server.
+                    // Do NOT inject for app proxy — the developer's server has no knowledge of this token.
+                    let builder = if inject_auth {
+                        builder.header("Authorization", format!("Bearer {api_key_owned}"))
+                    } else {
+                        builder
+                    };
 
-                    let (status, resp_body, resp_content_type) = match builder.send().await {
+                    let (status, resp_body, resp_encoding, resp_content_type) = match builder.send().await {
                         Ok(r) => {
                             let s = r.status().as_u16();
                             let ct = r.headers()
                                 .get("content-type")
                                 .and_then(|v| v.to_str().ok())
-                                .unwrap_or("application/json")
+                                .unwrap_or("application/octet-stream")
                                 .to_string();
-                            // Binary content types must be base64-encoded — WS frames are text-only.
-                            let is_binary = ct.starts_with("audio/") || ct.starts_with("image/")
-                                || ct == "application/octet-stream";
-                            let b = if is_binary {
-                                use base64::Engine as _;
-                                match r.bytes().await {
-                                    Ok(bytes) => base64::engine::general_purpose::STANDARD.encode(&bytes),
-                                    Err(_) => String::new(),
-                                }
-                            } else {
-                                r.text().await.unwrap_or_default()
+                            // Always base64-encode response bodies — handles binary and avoids
+                            // JSON string escaping issues with arbitrary text content.
+                            use base64::Engine as _;
+                            let (b, enc) = match r.bytes().await {
+                                Ok(bytes) => (base64::engine::general_purpose::STANDARD.encode(&bytes), "base64"),
+                                Err(_) => (String::new(), "base64"),
                             };
-                            (s, b, ct)
+                            (s, b, enc, ct)
                         }
                         Err(e) => {
                             tracing::warn!("[EC2Proxy] HTTP-over-WS reqwest error: {e}");
-                            (502u16, format!("{{\"error\":\"{}\" }}",  e), "application/json".to_string())
+                            (502u16, format!("{{\"error\":\"{}\" }}", e), "", "application/json".to_string())
                         }
                     };
 
@@ -897,6 +1043,7 @@ async fn handle_ec2_frame(
                         "id": req_id,
                         "status": status,
                         "body": resp_body,
+                        "body_encoding": resp_encoding,
                         "content_type": resp_content_type,
                     }).to_string();
                     let _ = resp_tx.send(resp_frame.into_bytes()).await;
