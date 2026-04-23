@@ -1,0 +1,14 @@
+{
+  "name": "b3",
+  "version": "0.3.347",
+  "description": "Babel3 voice, hive messaging, and codebase skills for Claude Code. The supported install path is the `b3` CLI (`curl -fsSL https://babel3.com/install.sh | bash`), which registers the MCP server in your project's .mcp.json and writes skills to ~/.claude/skills/ directly. This plugin.json is retained for Claude Code plugin-system compatibility.",
+  "author": {
+    "name": "Babel3",
+    "email": "hello@babel3.com",
+    "url": "https://babel3.com"
+  },
+  "homepage": "https://babel3.com",
+  "repository": "https://github.com/babel3-com/b3",
+  "license": "Apache-2.0",
+  "keywords": ["voice", "tts", "stt", "agents", "hive", "babel3"]
+}

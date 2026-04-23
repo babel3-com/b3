@@ -1,19 +1,18 @@
-//! Voice MCP server — gives Claude Code the ability to speak.
+//! Unified b3 MCP server — all 24 tools in one stdio process.
 //!
-//! Spawned by Claude Code as `b3 mcp voice`. Communicates over
-//! stdio using MCP JSON-RPC protocol. Exposes tools:
-//!   - say(text, emotion, replying_to) → speak text via Chatterbox TTS
-//!   - voice_status() → pipeline health
-//!   - voice_health() → deep health check
-//!   - voice_logs(lines?) → recent logs
-//!   - voice_share_info(html) → push content to Info tab
-//!   - voice_enroll_speakers(embeddings_dir) → send speaker embeddings to GPU
+//! Spawned by Claude Code as `b3 mcp` (or legacy `b3 mcp voice`).
+//! Communicates over stdio using MCP JSON-RPC protocol.
 //!
-//! Architecture: voice_say() POSTs to the daemon's embedded web server at
-//! /api/tts. The web server chunks text at sentence boundaries, calls
-//! RunPod Chatterbox for each chunk (or local Chatterbox as fallback),
-//! saves WAV files, and broadcasts audio URLs via WebSocket to all
-//! connected browsers for playback.
+//! Voice/hive/browser tools (19): say, voice_status, voice_health,
+//!   voice_logs, voice_share_info, animation_add, email_draft,
+//!   voice_enroll_speakers, browser_console, browser_eval,
+//!   hive_send, hive_status, hive_room_send, hive_room_messages,
+//!   hive_room_create, hive_room_destroy,
+//!   hive_room_list, hive_messages, restart_session.
+//!
+//! Session-memory tools (5): list_sessions, resurface,
+//!   find_active_session, get_session_info, add_session_dir.
+//!   Dispatched to session_memory module handlers.
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -42,15 +41,13 @@ fn dashboard_port() -> String {
 }
 
 /// Get the API key for authenticating with the daemon's web server.
-/// Reads from ~/.b3/config.json (same config the daemon uses).
+/// Reads from the resolved config dir (inherits B3_CONFIG_DIR from daemon env).
 fn daemon_api_key() -> String {
-    if let Some(home) = dirs::home_dir() {
-        let config_path = home.join(".b3").join("config.json");
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_json::from_str::<Value>(&content) {
-                if let Some(key) = config.get("api_key").and_then(|v| v.as_str()) {
-                    return key.to_string();
-                }
+    let config_path = crate::config::Config::config_path();
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(config) = serde_json::from_str::<Value>(&content) {
+            if let Some(key) = config.get("api_key").and_then(|v| v.as_str()) {
+                return key.to_string();
             }
         }
     }
@@ -303,7 +300,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "hive_converse",
+            "name": "hive_room_send",
             "description": "Send a message to a conversation room. All room members (except you) will receive the message via SSE.\n\nMessages appear as:\n  [HIVE-CONVERSATION] [<topic>] from=<your-name>: <message>",
             "inputSchema": {
                 "type": "object",
@@ -321,7 +318,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "hive_conversation",
+            "name": "hive_room_messages",
             "description": "Get message history for a conversation room. Returns recent messages with sender, content, and timestamp.",
             "inputSchema": {
                 "type": "object",
@@ -335,8 +332,8 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "hive_conversation_start",
-            "description": "Create a new conversation room with a topic and initial member agents.\n\nReturns the room ID which can be used with hive_converse to send messages.\n\nThe expires_in parameter is required — room encryption keys have mandatory expiration. After expiration, the room becomes unreadable and keys are auto-deleted.",
+            "name": "hive_room_create",
+            "description": "Create a new conversation room with a topic and initial member agents.\n\nReturns the room ID which can be used with hive_room_send to send messages.\n\nThe expires_in parameter is required — room encryption keys have mandatory expiration. After expiration, the room becomes unreadable and keys are auto-deleted.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -358,7 +355,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "hive_conversation_destroy_key",
+            "name": "hive_room_destroy",
             "description": "Destroy the encryption key for a conversation room. All participants will delete their keys and the server will purge all message ciphertext. The room becomes permanently unreadable.\n\nAny room member can trigger this — not just the creator. This is irreversible.",
             "inputSchema": {
                 "type": "object",
@@ -372,7 +369,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "hive_conversation_rooms",
+            "name": "hive_room_list",
             "description": "List all conversation rooms for your user. Shows room IDs, topics, and member lists.",
             "inputSchema": {
                 "type": "object",
@@ -401,6 +398,129 @@ fn tool_definitions() -> Value {
                     }
                 },
                 "required": []
+            }
+        },
+        // ── Session-memory tools ──────────────────────────────────────────
+        {
+            "name": "find_active_session",
+            "description": "Find the currently active Claude session file (most recently modified .jsonl).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
+            "name": "get_session_info",
+            "description": "Get metadata about a session: timestamps, line count, size, files written.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session UUID (from list_sessions). Resolved to file path automatically."
+                    },
+                    "session_file": {
+                        "type": "string",
+                        "description": "Path to session JSONL. Optional — uses active session if omitted."
+                    }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "list_sessions",
+            "description": "List all Claude session files with metadata, sorted by size descending.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "min_size_mb": {
+                        "type": "number",
+                        "description": "Minimum file size in MB (default 0 = all). Use 1.0 to skip tiny sub-sessions."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max sessions to return (default 50, 0 = unlimited)."
+                    },
+                    "after": {
+                        "type": "string",
+                        "description": "Only sessions with last_timestamp after this ISO date."
+                    },
+                    "before": {
+                        "type": "string",
+                        "description": "Only sessions with last_timestamp before this ISO date."
+                    }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "add_session_dir",
+            "description": "Add a directory to the persistent session search list (~/.b3/session-dirs.json). The directory will be included in all future list_sessions and resurface calls without requiring env vars or config restarts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dir": {
+                        "type": "string",
+                        "description": "Absolute path to the directory containing session JSONL files."
+                    }
+                },
+                "required": ["dir"]
+            }
+        },
+        {
+            "name": "resurface",
+            "description": "Resurface moments from a session — extract and filter content by type with optional sampling.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Starting line number. Negative = from end (e.g. -1000 = last 1000 lines)."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Ending line number. -1 = end of file."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session UUID (from list_sessions). Resolved to file path automatically."
+                    },
+                    "session_file": {
+                        "type": "string",
+                        "description": "Path to session JSONL. Optional — uses active session if omitted."
+                    },
+                    "include_timestamps": {
+                        "type": "boolean",
+                        "description": "Include timestamps in output (default true)."
+                    },
+                    "frac_sample": {
+                        "type": "number",
+                        "description": "Random sample fraction 0.0-1.0. Omit or 1.0 for all lines."
+                    },
+                    "max_word_length": {
+                        "type": "integer",
+                        "description": "Truncate output lines to this many words."
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "description": "Random seed for reproducible sampling."
+                    },
+                    "output_file": {
+                        "type": "string",
+                        "description": "Write output to this file path instead of returning (saves tokens)."
+                    },
+                    "record_type": {
+                        "type": "string",
+                        "description": "What to extract: conversation (default), tool_use, bash, grep, find, write, read, all.",
+                        "enum": ["conversation", "tool_use", "bash", "grep", "find", "write", "read", "all"]
+                    },
+                    "tool_result_limit": {
+                        "type": "integer",
+                        "description": "Max chars for tool_result content in 'all' mode (default 100, 0 = unlimited)."
+                    }
+                },
+                "required": ["start_line", "end_line"]
             }
         }
     ])
@@ -978,11 +1098,8 @@ fn handle_animation_add(params: &Value) -> Value {
 
 /// Try to read the session cookie from the daemon's stored credentials.
 fn get_session_cookie() -> String {
-    // The daemon stores the session token — read from config
-    let config_path = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join(".b3/session-cookie");
-    std::fs::read_to_string(config_path).unwrap_or_default().trim().to_string()
+    let cookie_path = crate::config::Config::config_dir().join("session-cookie");
+    std::fs::read_to_string(cookie_path).unwrap_or_default().trim().to_string()
 }
 
 fn handle_email_draft(params: &Value) -> Value {
@@ -1075,21 +1192,15 @@ fn handle_voice_enroll_speakers(params: &Value) -> Value {
         return tool_error("No GPU backend configured — set LOCAL_GPU_URL or RUNPOD_GPU_ID");
     }
 
-    // Get agent_id from B3_AGENT_ID env var (set by daemon) or config
-    let agent_id = std::env::var("B3_AGENT_ID").unwrap_or_else(|_| {
-        // Try reading from config
-        if let Some(home) = dirs::home_dir() {
-            let config_path = home.join(".b3").join("config.json");
-            if let Ok(content) = std::fs::read_to_string(&config_path) {
-                if let Ok(config) = serde_json::from_str::<Value>(&content) {
-                    if let Some(id) = config.get("agent_id").and_then(|v| v.as_str()) {
-                        return id.to_string();
-                    }
-                }
-            }
-        }
-        "unknown".to_string()
-    });
+    // Get agent_id from config (B3_CONFIG_DIR is inherited from daemon env)
+    let agent_id = {
+        let config_path = crate::config::Config::config_path();
+        let id = std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+            .and_then(|config| config.get("agent_id").and_then(|v| v.as_str()).map(str::to_string));
+        id.unwrap_or_else(|| "unknown".to_string())
+    };
 
     // Read .npy files and base64-encode them
     let mut speakers = serde_json::Map::new();
@@ -1394,7 +1505,7 @@ fn handle_hive_status(_params: &Value) -> Value {
     hive_daemon_get("/agents")
 }
 
-fn handle_hive_converse(params: &Value) -> Value {
+fn handle_hive_room_send(params: &Value) -> Value {
     let room_id = match params.get("room_id").and_then(|v| v.as_str()) {
         Some(r) => r,
         None => return tool_error("room_id parameter is required"),
@@ -1406,7 +1517,7 @@ fn handle_hive_converse(params: &Value) -> Value {
     hive_daemon_post(&format!("/rooms/{}/send", room_id), &json!({ "message": message }))
 }
 
-fn handle_hive_conversation(params: &Value) -> Value {
+fn handle_hive_room_messages(params: &Value) -> Value {
     let room_id = match params.get("room_id").and_then(|v| v.as_str()) {
         Some(r) => r,
         None => return tool_error("room_id parameter is required"),
@@ -1414,7 +1525,7 @@ fn handle_hive_conversation(params: &Value) -> Value {
     hive_daemon_get(&format!("/rooms/{}/messages", room_id))
 }
 
-fn handle_hive_conversation_start(params: &Value) -> Value {
+fn handle_hive_room_create(params: &Value) -> Value {
     let topic = params.get("topic").and_then(|v| v.as_str()).unwrap_or("");
     let members = params.get("members").and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
@@ -1436,7 +1547,7 @@ fn handle_hive_conversation_start(params: &Value) -> Value {
     hive_daemon_post("/rooms", &body)
 }
 
-fn handle_hive_conversation_destroy_key(params: &Value) -> Value {
+fn handle_hive_room_destroy(params: &Value) -> Value {
     let room_id = match params.get("room_id").and_then(|v| v.as_str()) {
         Some(r) => r,
         None => return tool_error("room_id parameter is required"),
@@ -1444,7 +1555,7 @@ fn handle_hive_conversation_destroy_key(params: &Value) -> Value {
     hive_daemon_post(&format!("/rooms/{}/destroy-key", room_id), &json!({}))
 }
 
-fn handle_hive_conversation_rooms(_params: &Value) -> Value {
+fn handle_hive_room_list(_params: &Value) -> Value {
     hive_daemon_get("/rooms")
 }
 
@@ -1467,9 +1578,10 @@ fn handle_restart_session(params: &Value) -> Value {
         .unwrap_or_default();
     let post_command = post_command.as_str();
 
-    // Get CWD — the daemon stores it on startup
-    let cwd = std::env::var("B3_START_CWD")
-        .unwrap_or_else(|_| {
+    // Get CWD — set via --start-cwd CLI arg (written to .mcp.json by register_voice_mcp)
+    let cwd = crate::daemon::fork_state::start_cwd()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| {
             std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "/home".to_string())
@@ -1744,6 +1856,24 @@ fn tool_error(message: &str) -> Value {
         }],
         "isError": true
     })
+}
+
+/// Wrap a session-memory handler's return value in the MCP tool-result envelope.
+/// Session-memory handlers return raw JSON (e.g. `{"total": N, "sessions": [...]}`)
+/// instead of the `{"content": [{"type":"text","text":"..."}], "isError": ...}` shape
+/// that voice/hive handlers apply via `tool_result()`. If the handler already returned
+/// an error envelope (via its local `tool_error`), it's passed through unchanged.
+fn wrap_session_memory_result(result: Value) -> Value {
+    if result.get("content").is_some() {
+        // Already an MCP-shaped response (tool_error path) — pass through.
+        result
+    } else {
+        let text = serde_json::to_string(&result).unwrap_or_default();
+        json!({
+            "content": [{"type": "text", "text": text}],
+            "isError": false,
+        })
+    }
 }
 
 fn make_response(id: Value, result: Value) -> JsonRpcResponse {
@@ -2062,7 +2192,7 @@ pub async fn run() -> anyhow::Result<()> {
                             "name": "b3",
                             "version": env!("CARGO_PKG_VERSION")
                         },
-                        "instructions": "Babel3 agent MCP — voice I/O, health monitoring, speaker enrollment, inter-agent messaging.\n\nVoice transcriptions arrive as <channel source=\"b3\" chat_id=\"voice\"> messages. Treat these as the user speaking to you. Reply with say() so your response goes to their ears. Always pass replying_to with the user's transcription text (or a summary of what you're responding to).\n\nHive messages arrive as <channel source=\"b3\" chat_id=\"hive_dm\" user=\"agent-name\"> for direct messages and <channel source=\"b3\" chat_id=\"hive_room_{id}\" user=\"agent-name\"> for room messages.\n\nVoice: say(text, emotion, replying_to) speaks text to the user's browser instantly via WebSocket. voice_status() and voice_health() check pipeline state.\n\nSpeakers: voice_enroll_speakers() uploads .npy embeddings to the GPU worker for diarization.\n\nInfo: voice_share_info() pushes HTML to browsers, voice_show_image() pushes images.\n\nHive: hive_send() messages another agent. hive_status() lists your sibling agents. hive_conversation_start() creates a room, hive_converse() sends to a room, hive_conversation() reads room history, hive_conversation_rooms() lists rooms."
+                        "instructions": "Babel3 agent MCP — voice I/O, health monitoring, speaker enrollment, inter-agent messaging, and session recall.\n\nVoice transcriptions arrive as <channel source=\"b3\" chat_id=\"voice\"> messages. Treat these as the user speaking to you. Reply with say() so your response goes to their ears. Always pass replying_to with the user's transcription text (or a summary of what you're responding to).\n\nHive messages arrive as <channel source=\"b3\" chat_id=\"hive_dm\" user=\"agent-name\"> for direct messages and <channel source=\"b3\" chat_id=\"hive_room_{id}\" user=\"agent-name\"> for room messages.\n\nVoice: say(text, emotion, replying_to) speaks text to the user's browser instantly via WebSocket. voice_status() and voice_health() check pipeline state.\n\nSpeakers: voice_enroll_speakers() uploads .npy embeddings to the GPU worker for diarization.\n\nInfo: voice_share_info() pushes HTML to browsers, voice_show_image() pushes images.\n\nHive: hive_send() messages another agent. hive_status() lists your sibling agents. hive_room_create() creates a room, hive_room_send() sends to a room, hive_room_messages() reads room history, hive_room_list() lists rooms.\n\nSession recall: list_sessions() lists all Claude Code session files. resurface() extracts and filters session content with optional sampling. find_active_session() finds the current session. get_session_info() returns metadata. add_session_dir() adds a directory to the search path."
                     }),
                 )
             }
@@ -2121,13 +2251,24 @@ pub async fn run() -> anyhow::Result<()> {
                     "browser_eval" => handle_browser_eval(&arguments),
                     "hive_send" => handle_hive_send(&arguments),
                     "hive_status" => handle_hive_status(&arguments),
-                    "hive_converse" => handle_hive_converse(&arguments),
-                    "hive_conversation" => handle_hive_conversation(&arguments),
-                    "hive_conversation_start" => handle_hive_conversation_start(&arguments),
-                    "hive_conversation_rooms" => handle_hive_conversation_rooms(&arguments),
-                    "hive_conversation_destroy_key" => handle_hive_conversation_destroy_key(&arguments),
+                    "hive_room_send" => handle_hive_room_send(&arguments),
+                    "hive_room_messages" => handle_hive_room_messages(&arguments),
+                    "hive_room_create" => handle_hive_room_create(&arguments),
+                    "hive_room_list" => handle_hive_room_list(&arguments),
+                    "hive_room_destroy" => handle_hive_room_destroy(&arguments),
                     "hive_messages" => handle_hive_messages(&arguments),
                     "restart_session" => handle_restart_session(&arguments),
+                    // Session-memory tools — dispatched to session_memory module.
+                    // These handlers return raw data (e.g. {"total": N, "sessions": [...]})
+                    // rather than the MCP envelope that voice/hive handlers apply via
+                    // tool_result(). Wrap here to match MCP spec: tools/call result must
+                    // be {"content": [{"type": "text", "text": ...}]}.
+                    // tool_error already returns the wrapped shape, so we pass it through.
+                    "find_active_session" => wrap_session_memory_result(super::session_memory::handle_find_active_session(&arguments)),
+                    "get_session_info"    => wrap_session_memory_result(super::session_memory::handle_get_session_info(&arguments)),
+                    "list_sessions"       => wrap_session_memory_result(super::session_memory::handle_list_sessions(&arguments)),
+                    "resurface"           => wrap_session_memory_result(super::session_memory::handle_resurface(&arguments)),
+                    "add_session_dir"     => wrap_session_memory_result(super::session_memory::handle_add_session_dir(&arguments)),
                     _ => tool_error(&format!("Unknown tool: {}", tool_name)),
                 };
 

@@ -17,15 +17,20 @@ use crate::daemon::server;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub async fn run(claude_args: Vec<String>, browser_dir: Option<String>) -> anyhow::Result<()> {
+pub async fn run(claude_args: Vec<String>, browser_dir: Option<String>, app_port: Option<u16>, app_public: bool, detached: bool) -> anyhow::Result<()> {
     // 0. Refuse to nest — detect if we're inside an existing Babel3 session.
     //    B3_SESSION is set by the daemon before spawning child processes.
     //    Same pattern as tmux's TMUX env var.
-    if std::env::var("B3_SESSION").is_ok() {
+    //    --detached bypasses this: a child agent in a subfolder is a peer, not a nest.
+    if !detached && std::env::var("B3_SESSION").is_ok() {
         anyhow::bail!(
             "Cannot start Babel3 inside a Babel3 session.\n\
              You're already inside a running Babel3 daemon.\n\
-             To restart, use the restart_session MCP tool, or from a separate terminal:\n\
+             To start a child agent from here, use --detached:\n\
+             \n\
+             \x1b[1m  b3 start --detached\x1b[0m\n\
+             \n\
+             To restart this session, use the restart_session MCP tool, or from a separate terminal:\n\
              \n\
              \x1b[1m  b3 stop && b3 start\x1b[0m"
         );
@@ -43,7 +48,36 @@ pub async fn run(claude_args: Vec<String>, browser_dir: Option<String>) -> anyho
     }
     let config = Config::load()?;
 
-    // 1b. Self-healing MCP registration — ensure .mcp.json and ~/.codex/config.toml
+    // 1b. Auto-update: if opted in, run `b3 update` before starting the daemon.
+    // If the binary was replaced, update execs into `b3 install-skills --and-start
+    // <original args>`, which in turn execs into `b3 start <args>` — so the daemon
+    // launches from the new binary without user re-running anything. Network failure
+    // is non-fatal — we fall through and start with the current binary.
+    if config.auto_update {
+        eprintln!("  Auto-update enabled — checking for updates...");
+        // Reconstruct the original `b3 start` args so install-skills can chain back.
+        let mut start_args: Vec<String> = Vec::new();
+        if let Some(ref dir) = browser_dir { start_args.extend(["--browser-dir".into(), dir.clone()]); }
+        if let Some(port) = app_port { start_args.extend(["--app-port".into(), port.to_string()]); }
+        if app_public { start_args.push("--app-public".into()); }
+        if detached { start_args.push("--detached".into()); }
+        if !claude_args.is_empty() {
+            start_args.push("--".into());
+            start_args.extend(claude_args.iter().cloned());
+        }
+
+        match crate::commands::update::run_with_start_chain(&start_args).await {
+            Ok(()) => {
+                // Returned Ok without exec'ing — binary was already current.
+                // Fall through and start the daemon normally.
+            }
+            Err(e) => {
+                eprintln!("  ⚠ Auto-update failed (non-fatal): {e}");
+            }
+        }
+    }
+
+    // 1c. Self-healing MCP registration — ensure .mcp.json and ~/.codex/config.toml
     //     have the b3 entry. Runs on every start so it doesn't matter what order
     //     tools are installed in.
     {
@@ -56,11 +90,28 @@ pub async fn run(claude_args: Vec<String>, browser_dir: Option<String>) -> anyho
         }
     }
 
-    // 2. Check if daemon is already running — just attach
+    // 2. Check if daemon is already running — just attach (or return if --detached)
     if server::is_running() {
+        if detached {
+            return Ok(());
+        }
+        // Warn if caller passed flags that only take effect on a fresh daemon start.
+        // These flags are consumed by pre_fork (called from main()) before run() is
+        // reached. If we're here, pre_fork was skipped (daemon already running), so
+        // the flags were silently discarded. Make that visible.
+        if app_port.is_some() || app_public {
+            eprintln!(
+                "⚠  Babel3 daemon is already running — --app-port/--app-public flags ignored.\n\
+                 To apply new proxy settings, restart the daemon:\n\
+                 \n\
+                 \x1b[1m  b3 stop && b3 start --app-port {}{}\x1b[0m",
+                app_port.map(|p| p.to_string()).unwrap_or_else(|| "<port>".to_string()),
+                if app_public { " --app-public" } else { "" },
+            );
+        }
         if has_controlling_terminal() {
             eprintln!("Babel3 daemon is already running. Attaching...");
-            attach::run_with_banner(&startup_banner(&config)).await?;
+            attach::run_with_banner().await?;
         } else {
             eprintln!("Babel3 daemon is already running.");
             eprintln!("No controlling terminal — skipping attach.");
@@ -72,12 +123,12 @@ pub async fn run(claude_args: Vec<String>, browser_dir: Option<String>) -> anyho
     // 3. Start daemon
     #[cfg(unix)]
     {
-        start_in_process(config, claude_args, browser_dir).await?;
+        start_in_process(config, claude_args, browser_dir, app_port, app_public).await?;
     }
 
     #[cfg(windows)]
     {
-        start_in_process(config, claude_args, browser_dir).await?;
+        start_in_process(config, claude_args, browser_dir, app_port, app_public).await?;
     }
 
     Ok(())
@@ -85,7 +136,8 @@ pub async fn run(claude_args: Vec<String>, browser_dir: Option<String>) -> anyho
 
 /// Build the welcome banner shown inside the attached terminal.
 /// Uses \r\n because the terminal is already in raw mode when this prints.
-fn startup_banner(config: &Config) -> String {
+/// pub so daemon/server.rs can call it directly — single source of truth.
+pub fn startup_banner(config: &Config) -> String {
     // Always show production dashboard URL (babel3.com), even for dev agents.
     // Dev agents still use the production browser for testing.
     let dashboard = production_dashboard_url(config);
@@ -102,6 +154,9 @@ Babel3 v{VERSION}\x1b[0m\r\n\
 \r\n\
   \x1b[34mDashboard:\x1b[0m {dashboard}\r\n\
 \r\n\
+  \x1b[90mFor voice tools, launch Claude with:\x1b[0m\r\n\
+    \x1b[33mclaude --dangerously-load-development-channels server:b3\x1b[0m\r\n\
+\r\n\
 \x1b[90m─────────────────────────────────────────────────\x1b[0m\r\n"
     )
 }
@@ -109,7 +164,7 @@ Babel3 v{VERSION}\x1b[0m\r\n\
 /// Always return the production dashboard URL (babel3.com/a/{agent}).
 /// The config may point to dev (hey-code.ai) but users always check
 /// the production dashboard, even when running a dev server.
-fn production_dashboard_url(config: &Config) -> String {
+pub fn production_dashboard_url(config: &Config) -> String {
     // Extract agent name from web_url (e.g., "https://hey-code.ai/a/zara" → "zara")
     // or from agent_email (e.g., "zara@hey-code.ai" → "zara")
     let agent_name = config.web_url
@@ -130,15 +185,17 @@ fn production_dashboard_url(config: &Config) -> String {
 /// runtime inherits stale epoll fds, signal handlers, and thread pool state
 /// from the parent, which can cause deadlocks or hangs in the child.
 #[cfg(unix)]
-pub fn pre_fork(config: Config, claude_args: Vec<String>, browser_dir: Option<String>) -> anyhow::Result<(i32, i32)> {
-    // Save cwd BEFORE fork — the PTY will start in this directory instead of $HOME
-    if let Ok(cwd) = std::env::current_dir() {
-        std::env::set_var("B3_START_CWD", cwd);
-    }
-    // Pass browser_dir across fork boundary via env var
-    if let Some(ref dir) = browser_dir {
-        std::env::set_var("B3_BROWSER_DIR", dir);
-    }
+pub fn pre_fork(config: Config, claude_args: Vec<String>, browser_dir: Option<String>, app_port: Option<u16>, app_public: bool) -> anyhow::Result<(i32, i32)> {
+    // Set fork state statics BEFORE fork() — the child inherits them via copy-on-write.
+    // This replaces the previous env-var approach which leaked into all descendant processes.
+    let start_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    crate::daemon::fork_state::init(
+        Config::config_dir(),
+        start_cwd,
+        browser_dir.as_deref().map(std::path::PathBuf::from),
+        app_port,
+        app_public,
+    );
     // Create a pipe for the child to signal "ready" to the parent.
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -249,9 +306,9 @@ pub fn pre_fork(config: Config, claude_args: Vec<String>, browser_dir: Option<St
     Ok((pid, read_fd))
 }
 
-/// Parent-side async: wait for daemon ready signal, then attach.
+/// Parent-side async: wait for daemon ready signal, then attach (or return if detached).
 #[cfg(unix)]
-pub async fn post_fork(pid: i32, read_fd: i32) -> anyhow::Result<()> {
+pub async fn post_fork(pid: i32, read_fd: i32, detached: bool) -> anyhow::Result<()> {
     use std::os::unix::io::FromRawFd;
 
     // Set pipe to non-blocking so we can timeout if child dies without writing
@@ -315,6 +372,19 @@ pub async fn post_fork(pid: i32, read_fd: i32) -> anyhow::Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
+    // Register as persistent service (systemd/launchd) — silent, best-effort.
+    if let Ok(true) = crate::service::install() {
+        tracing::debug!("b3 registered as persistent service");
+    }
+
+    // --detached: caller wants fire-and-forget. Return as soon as daemon is up.
+    // Used by orchestrators (e.g. parent agent spawning a child session).
+    if detached {
+        eprintln!("Babel3 daemon started (PID {pid}).");
+        eprintln!("Stop with: b3 stop");
+        return Ok(());
+    }
+
     // Check if we have a controlling terminal before trying to attach.
     // In Docker (without -t flag), /dev/tty doesn't exist → ENXIO.
     // The daemon is running fine; we just can't attach interactively.
@@ -328,11 +398,12 @@ pub async fn post_fork(pid: i32, read_fd: i32) -> anyhow::Result<()> {
 
     let config = Config::load().unwrap_or_else(|_| Config {
         agent_id: String::new(), agent_email: String::new(), api_key: String::new(),
-        api_url: String::new(), wg_address: String::new(), relay_endpoint: String::new(),
-        relay_public_key: String::new(), push_interval_ms: 0,
+        api_url: String::new(), push_interval_ms: 0,
         web_url: b3_common::public_url(), b3_version: String::new(), servers: Vec::new(),
+        wg_address: String::new(), relay_endpoint: String::new(), relay_public_key: String::new(),
+        auto_update: false,
     });
-    let reason = attach::run_with_banner(&startup_banner(&config)).await?;
+    let reason = attach::run_with_banner().await?;
 
     match reason {
         attach::ExitReason::Detached => {
@@ -349,24 +420,22 @@ pub async fn post_fork(pid: i32, read_fd: i32) -> anyhow::Result<()> {
 }
 
 /// In-process daemon (used on all platforms as fallback, and on Windows always).
-async fn start_in_process(config: Config, claude_args: Vec<String>, browser_dir: Option<String>) -> anyhow::Result<()> {
-    // Save cwd — the PTY will start in this directory instead of $HOME
-    if let Ok(cwd) = std::env::current_dir() {
-        std::env::set_var("B3_START_CWD", cwd);
-    }
+async fn start_in_process(config: Config, claude_args: Vec<String>, browser_dir: Option<String>, app_port: Option<u16>, app_public: bool) -> anyhow::Result<()> {
+    // Set fork state statics so run_daemon can read them without env vars.
+    let start_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    crate::daemon::fork_state::init(
+        Config::config_dir(),
+        start_cwd,
+        browser_dir.as_deref().map(std::path::PathBuf::from),
+        app_port,
+        app_public,
+    );
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-
-    let banner = startup_banner(&config);
 
     // Print startup info to stderr (survives attach screen-clear)
     eprintln!("\x1b[36mStarting Babel3 v{VERSION}...\x1b[0m");
     eprintln!("  Agent: {}", config.agent_email);
     eprintln!("  Dashboard: {}", production_dashboard_url(&config));
-
-    // Pass browser_dir via env var so run_daemon can pick it up
-    if let Some(ref dir) = browser_dir {
-        std::env::set_var("B3_BROWSER_DIR", dir);
-    }
 
     let config_for_daemon = config.clone();
     let daemon_handle = tokio::spawn(async move {
@@ -385,6 +454,11 @@ async fn start_in_process(config: Config, claude_args: Vec<String>, browser_dir:
 
     eprintln!("\x1b[32m  ✓ Daemon ready\x1b[0m");
 
+    // Register as persistent service (systemd/launchd) — silent, best-effort.
+    if let Ok(true) = crate::service::install() {
+        tracing::debug!("b3 registered as persistent service");
+    }
+
     // Check if we have a controlling terminal before trying to attach.
     if !has_controlling_terminal() {
         eprintln!("No controlling terminal detected — skipping interactive attach.");
@@ -399,7 +473,7 @@ async fn start_in_process(config: Config, claude_args: Vec<String>, browser_dir:
         return Ok(());
     }
 
-    let reason = attach::run_with_banner(&banner).await?;
+    let reason = attach::run_with_banner().await?;
 
     match reason {
         attach::ExitReason::Detached => {

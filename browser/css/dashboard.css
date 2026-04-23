@@ -196,6 +196,7 @@ body {
 /* Terminal key strip — left-aligned, dark background */
 .term-keys {
     display: flex;
+    flex-wrap: wrap;
     gap: 4px;
     padding: 4px 6px;
     background: #1a1a2e;
@@ -518,6 +519,137 @@ body.terminal-keyboard-text .content {
     accent-color: var(--accent); cursor: pointer; margin: 0;
 }
 .layout-toggle span { font-size: 0.78rem; }
+
+/* === Term Key Picker === */
+#term-key-picker { display: flex; flex-direction: column; gap: 6px; }
+/* ── Term Key Picker ── */
+.tkp-active, .tkp-pool {
+    display: flex; flex-wrap: wrap; gap: 4px; min-height: 24px;
+}
+.tkp-active {
+    padding: 4px 6px; background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;
+    margin-bottom: 4px;
+}
+.tkp-pool { padding: 2px 0; }
+.tkp-chip {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 28px; height: 22px; padding: 0 6px;
+    border-radius: 4px; border: none; cursor: pointer;
+    font-size: 0.7rem; font-family: monospace; font-weight: 600;
+    transition: background 0.12s, transform 0.08s;
+    line-height: 1;
+}
+.tkp-chip:active { transform: scale(0.92); }
+.tkp-chip-active { background: var(--accent, #58a6ff); color: #000; }
+.tkp-chip-active:hover { filter: brightness(1.15); }
+.tkp-chip-pool { background: rgba(255,255,255,0.08); color: var(--text-dim, #8b949e); }
+.tkp-chip-pool:hover { background: rgba(255,255,255,0.15); color: #fff; }
+.tkp-chip-user { border: 1px solid rgba(88,166,255,0.3); }
+.tkp-chip-danger { background: rgba(248,81,73,0.2) !important; color: var(--red, #f85149) !important; border-color: rgba(248,81,73,0.4) !important; }
+.tkp-empty {
+    font-size: 0.68rem; color: rgba(255,255,255,0.3); align-self: center; font-style: italic;
+}
+.tkp-bottom-row { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
+.tkp-add-btn {
+    padding: 3px 8px; font-size: 0.68rem;
+    background: rgba(88,166,255,0.12); color: var(--accent, #58a6ff);
+    border: 1px solid rgba(88,166,255,0.25); border-radius: 4px;
+    cursor: pointer; transition: background 0.12s, border-color 0.12s;
+}
+.tkp-add-btn:hover { background: rgba(88,166,255,0.22); border-color: rgba(88,166,255,0.5); }
+.tkp-reset-btn {
+    padding: 3px 8px; font-size: 0.68rem;
+    background: none; color: var(--text-dim, #8b949e);
+    border: none; cursor: pointer; opacity: 0.6;
+    transition: opacity 0.12s;
+}
+.tkp-reset-btn:hover { opacity: 1; }
+
+/* ── Key Capture Overlay ── */
+#tkp-capture-overlay {
+    position: fixed; inset: 0; z-index: 9999;
+    background: rgba(0,0,0,0.72); backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px;
+}
+.tkp-capture-panel {
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 12px; padding: 20px; width: 100%; max-width: 320px;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.6);
+    display: flex; flex-direction: column; gap: 12px;
+    animation: tkp-pop 0.15s ease-out;
+}
+@keyframes tkp-pop {
+    from { opacity: 0; transform: scale(0.93) translateY(6px); }
+    to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.tkp-capture-title {
+    font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--text-dim, #8b949e);
+}
+/* Modifier toggles */
+.tkp-mod-row { display: flex; gap: 6px; }
+.tkp-mod-btn {
+    flex: 1; padding: 7px 4px; font-size: 0.78rem; font-family: monospace; font-weight: 700;
+    background: rgba(255,255,255,0.06); color: var(--text-dim, #8b949e);
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 6px;
+    cursor: pointer; transition: all 0.12s; user-select: none;
+}
+.tkp-mod-btn.tkp-mod-active {
+    background: rgba(88,166,255,0.18); color: var(--accent, #58a6ff);
+    border-color: rgba(88,166,255,0.5);
+}
+/* Base key select */
+.tkp-key-select {
+    width: 100%; padding: 8px 10px; font-size: 0.82rem;
+    background: #0d1117; color: #c9d1d9;
+    border: 1px solid #30363d; border-radius: 6px; outline: none;
+    cursor: pointer; appearance: auto;
+    transition: border-color 0.12s;
+}
+.tkp-key-select:focus { border-color: var(--accent, #58a6ff); }
+/* Preview display */
+.tkp-capture-display {
+    min-height: 48px; display: flex; align-items: center; justify-content: center;
+    background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+}
+.tkp-capture-hint { font-size: 0.72rem; color: rgba(255,255,255,0.22); font-style: italic; }
+.tkp-capture-key {
+    font-size: 1.3rem; font-weight: 700; font-family: monospace;
+    color: var(--accent, #58a6ff); letter-spacing: 0.02em;
+    text-shadow: 0 0 16px rgba(88,166,255,0.35);
+    animation: tkp-flash 0.15s ease-out;
+}
+@keyframes tkp-flash {
+    from { opacity: 0; transform: scale(1.2); }
+    to   { opacity: 1; transform: scale(1); }
+}
+/* Label input */
+.tkp-capture-label {
+    width: 100%; padding: 7px 10px; font-size: 0.8rem; font-family: monospace;
+    background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+    color: #c9d1d9; outline: none; transition: border-color 0.12s;
+}
+.tkp-capture-label:focus { border-color: var(--accent, #58a6ff); }
+/* Actions */
+.tkp-capture-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.tkp-cap-btn {
+    padding: 7px 16px; font-size: 0.78rem; border-radius: 6px;
+    border: 1px solid transparent; cursor: pointer; transition: all 0.12s;
+}
+.tkp-cap-cancel {
+    background: rgba(255,255,255,0.06); color: var(--text-dim, #8b949e);
+    border-color: rgba(255,255,255,0.1);
+}
+.tkp-cap-cancel:hover { background: rgba(255,255,255,0.1); color: #c9d1d9; }
+.tkp-cap-add { background: var(--accent, #58a6ff); color: #000; font-weight: 600; }
+.tkp-cap-add:hover:not(:disabled) { filter: brightness(1.1); }
+.tkp-cap-add:disabled { opacity: 0.35; cursor: not-allowed; }
+/* Desktop hint */
+.tkp-capture-hint-kb {
+    font-size: 0.65rem; color: rgba(255,255,255,0.18); text-align: center; font-style: italic;
+}
 
 /* === Fullscreen Mode === */
 body.hc-fullscreen { padding: 0 !important; gap: 0; }

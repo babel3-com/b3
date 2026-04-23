@@ -4,16 +4,16 @@ mod commands;
 mod http;
 mod mcp;
 mod pty;
-mod mesh;
 mod bridge;
 mod config;
 mod crypto;
 mod daemon;
 mod service;
 mod logging;
+mod skills;
 
 #[derive(Parser)]
-#[command(name = "b3", version, about = "Babel3 — voice interface + mesh network for Claude Code")]
+#[command(name = "b3", version, about = "Babel3 — voice interface for Claude Code")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -36,6 +36,18 @@ enum Commands {
         /// Points to a directory containing static/open/ with JS/CSS files.
         #[arg(long)]
         browser_dir: Option<String>,
+        /// Forward /app/a/:agent/* requests to this local port.
+        /// Enables serving a custom HTTP app via babel3.com with HTTPS + NAT traversal.
+        #[arg(long)]
+        app_port: Option<u16>,
+        /// Allow unauthenticated visitors to reach /app/a/:agent/*.
+        /// When omitted, only the authenticated owner can access the app URL.
+        #[arg(long)]
+        app_public: bool,
+        /// Start daemon in background without attaching. Skips the B3_SESSION nesting
+        /// check so a child agent can be launched from inside the parent's session.
+        #[arg(long)]
+        detached: bool,
         /// Arguments to pass through to Claude Code CLI
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         claude_args: Vec<String>,
@@ -57,7 +69,11 @@ enum Commands {
     /// Show version
     Version,
     /// Update to latest version
-    Update,
+    Update {
+        /// Re-run install-skills and plugin migration even if already on the latest version
+        #[arg(long)]
+        force: bool,
+    },
     /// Set or change the daemon password
     SetPassword {
         /// Set password non-interactively (for scripting / agent-manager)
@@ -69,11 +85,27 @@ enum Commands {
         #[command(subcommand)]
         action: HiveAction,
     },
+    /// Manage child agents (spawn, list, kill)
+    Child {
+        #[command(subcommand)]
+        action: ChildAction,
+    },
     /// Internal: run as MCP server (spawned by Claude Code, not by user)
     #[command(hide = true)]
     Mcp {
+        /// Subcommand: serve (default), voice (legacy alias), session-memory (legacy alias).
+        /// Bare `b3 mcp` defaults to `serve`.
         #[command(subcommand)]
-        service: McpService,
+        service: Option<McpService>,
+    },
+    /// Internal: extract embedded skills to ~/.claude/skills/ and refresh MCP configs.
+    /// Called by `b3 update` after binary replacement. Not for direct use.
+    #[command(hide = true)]
+    InstallSkills {
+        /// After refreshing skills, exec into `b3 start <args>` from this binary.
+        /// Passed by `b3 start --auto-update` so the daemon launches from the new binary.
+        #[arg(long, num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
+        and_start: Vec<String>,
     },
 }
 
@@ -105,10 +137,54 @@ enum HiveAction {
 }
 
 #[derive(Subcommand)]
+enum ChildAction {
+    /// Spawn a new child agent
+    Spawn {
+        /// Name for the child agent
+        name: String,
+        /// Optional expiry duration (e.g. 1h, 30m, 2d)
+        #[arg(long)]
+        expires_in: Option<String>,
+    },
+    /// List child agents
+    List {
+        /// Include deleted/expired agents
+        #[arg(long)]
+        all: bool,
+    },
+    /// Kill a child agent by name or id
+    Kill {
+        /// Child agent name or id (hc-*)
+        name_or_id: String,
+    },
+    /// Restore a killed or expired child agent by id (or name if still listed)
+    Restore {
+        /// Child agent id (hc-*) or name
+        name_or_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum McpService {
-    /// Voice MCP server (stdio transport)
-    Voice,
-    /// Session memory MCP server (stdio transport)
+    /// Run the unified b3 MCP server (stdio transport)
+    Serve {
+        /// Config directory to use (replaces B3_CONFIG_DIR env var).
+        #[arg(long)]
+        config_dir: Option<String>,
+        /// Working directory the daemon was started in (replaces B3_START_CWD env var).
+        #[arg(long)]
+        start_cwd: Option<String>,
+    },
+    /// Legacy alias for `b3 mcp serve` — kept so existing .mcp.json entries keep working
+    #[command(hide = true)]
+    Voice {
+        #[arg(long)]
+        config_dir: Option<String>,
+        #[arg(long)]
+        start_cwd: Option<String>,
+    },
+    /// Legacy alias for `b3 mcp serve` — kept so existing .mcp.json entries keep working
+    #[command(hide = true)]
     SessionMemory,
 }
 
@@ -129,19 +205,19 @@ fn main() -> anyhow::Result<()> {
     // Forking inside an async runtime inherits stale epoll fds and signal handlers,
     // causing deadlocks in the child process (especially in Docker containers).
     #[cfg(unix)]
-    if let Some(Commands::Start { ref claude_args, ref browser_dir }) = cli.command {
+    if let Some(Commands::Start { ref claude_args, ref browser_dir, ref app_port, ref app_public, ref detached }) = cli.command {
         if config::Config::exists() {
             let cfg = config::Config::load()?;
             if !daemon::server::is_running() {
                 // Fork now — before tokio. Child enters its own runtime and runs daemon.
                 // Parent gets (pid, read_fd) to wait on.
-                let (pid, read_fd) = commands::start::pre_fork(cfg, claude_args.clone(), browser_dir.clone())?;
+                let (pid, read_fd) = commands::start::pre_fork(cfg, claude_args.clone(), browser_dir.clone(), *app_port, *app_public)?;
 
-                // Parent: enter tokio runtime and do the async attach
+                // Parent: enter tokio runtime and do the async attach (or skip if --detached)
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?;
-                return rt.block_on(commands::start::post_fork(pid, read_fd));
+                return rt.block_on(commands::start::post_fork(pid, read_fd, *detached));
             }
         }
         // If config doesn't exist or daemon is already running, fall through to normal async path
@@ -171,14 +247,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     match command {
         Commands::Setup { token, name } => commands::setup::run(token, name).await,
-        Commands::Start { claude_args, browser_dir } => commands::start::run(claude_args, browser_dir).await,
+        Commands::Start { claude_args, browser_dir, app_port, app_public, detached } => commands::start::run(claude_args, browser_dir, app_port, app_public, detached).await,
         Commands::Attach => commands::attach::run().await.map(|_| ()),
         Commands::Status => commands::status::run().await,
         Commands::Stop { force } => commands::stop::run(force).await,
         Commands::Login => commands::login::run().await,
         Commands::Uninstall => commands::uninstall::run().await,
         Commands::Version => commands::version::run().await,
-        Commands::Update => commands::update::run().await,
+        Commands::Update { force } => commands::update::run(force).await,
         Commands::SetPassword { password } => commands::set_password::run(password).await,
         Commands::Hive { action } => match action {
             HiveAction::Send { agent, message } => {
@@ -191,9 +267,74 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 commands::hive::converse(&room_id, &message).await
             }
         },
-        Commands::Mcp { service } => match service {
-            McpService::Voice => mcp::voice::run().await,
-            McpService::SessionMemory => mcp::session_memory::run().await,
+        Commands::Child { action } => match action {
+            ChildAction::Spawn { name, expires_in } => {
+                commands::child::spawn(&name, expires_in.as_deref()).await
+            }
+            ChildAction::List { all } => commands::child::list(all).await,
+            ChildAction::Kill { name_or_id } => commands::child::kill(&name_or_id).await,
+            ChildAction::Restore { name_or_id } => commands::child::restore(&name_or_id).await,
+        },
+        Commands::Mcp { service } => {
+            // All three variants (Serve, Voice, SessionMemory) run the same unified
+            // b3 MCP server. Voice and SessionMemory are legacy aliases kept so
+            // existing .mcp.json entries continue to work without reconfiguration.
+            let (config_dir, start_cwd) = match service {
+                Some(McpService::Serve { config_dir, start_cwd })
+                | Some(McpService::Voice { config_dir, start_cwd }) => (config_dir, start_cwd),
+                Some(McpService::SessionMemory) | None => (None, None),
+            };
+            // Init fork_state from CLI args — the MCP subprocess is exec'd fresh
+            // by Claude Code, so it doesn't share the daemon's process space.
+            let cwd = start_cwd
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            let cfg_dir = config_dir
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(config::Config::config_dir);
+            daemon::fork_state::init(cfg_dir, cwd, None, None, false);
+            mcp::b3::run().await
+        },
+        Commands::InstallSkills { and_start } => {
+            let b3_bin = commands::setup::find_b3_binary();
+            match commands::setup::install_skills() {
+                Ok(path) => println!("  Skills refreshed at {}", path.display()),
+                Err(e) => println!("  ⚠ Could not refresh skills: {e}"),
+            }
+            if let Err(e) = commands::setup::register_voice_mcp(&b3_bin) {
+                println!("  ⚠ Could not refresh .mcp.json: {e}");
+            }
+            if let Err(e) = commands::setup::register_codex_mcp(&b3_bin) {
+                tracing::debug!("Codex MCP refresh (non-fatal): {e}");
+            }
+            let _ = commands::setup::uninstall_claude_plugin_if_present();
+            commands::setup::remove_legacy_session_memory_entry();
+            // Chain into `b3 start <args>` if requested (auto-update path).
+            // exec() replaces this process — daemon launches from the new binary.
+            if !and_start.is_empty() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    let current_exe = std::env::current_exe().unwrap_or(b3_bin);
+                    let err = std::process::Command::new(&current_exe)
+                        .arg("start")
+                        .args(&and_start)
+                        .exec();
+                    eprintln!("  ⚠ Could not exec into b3 start: {err}");
+                }
+                #[cfg(windows)]
+                {
+                    let current_exe = std::env::current_exe().unwrap_or(b3_bin);
+                    let _ = std::process::Command::new(&current_exe)
+                        .arg("start")
+                        .args(&and_start)
+                        .spawn();
+                }
+            }
+            Ok(())
         },
     }
 }

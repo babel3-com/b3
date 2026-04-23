@@ -15,11 +15,18 @@ use crate::daemon::ipc::IpcStream;
 use crate::daemon::protocol::{self, Message};
 use crate::daemon::server;
 
-pub async fn run() -> anyhow::Result<ExitReason> {
-    run_with_banner("").await
+/// Signal sent from the stdin thread to the main task on Ctrl+B d / Ctrl+B q.
+#[derive(Debug)]
+enum StdinSignal {
+    Detach,
+    Stop,
 }
 
-pub async fn run_with_banner(banner: &str) -> anyhow::Result<ExitReason> {
+pub async fn run() -> anyhow::Result<ExitReason> {
+    run_with_banner().await
+}
+
+pub async fn run_with_banner() -> anyhow::Result<ExitReason> {
     // Check if daemon is running
     if !server::is_running() {
         anyhow::bail!(
@@ -55,9 +62,6 @@ pub async fn run_with_banner(banner: &str) -> anyhow::Result<ExitReason> {
     let _raw_guard = RawModeGuard;
 
     print!("\x1b[2J\x1b[H"); // Clear screen
-    if !banner.is_empty() {
-        print!("{banner}");
-    }
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
     // Spawn output reader task (daemon → stdout)
@@ -87,7 +91,7 @@ pub async fn run_with_banner(banner: &str) -> anyhow::Result<ExitReason> {
     // Spawn stdin reader thread (stdin → daemon)
     // Must use OS thread because stdin.read() is blocking
     let rt = tokio::runtime::Handle::current();
-    let (detach_tx, mut detach_rx) = tokio::sync::oneshot::channel::<()>();
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<StdinSignal>();
 
     let writer_handle = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
 
@@ -99,7 +103,6 @@ pub async fn run_with_banner(banner: &str) -> anyhow::Result<ExitReason> {
     }
 
     let writer_for_stdin = writer_handle.clone();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
     std::thread::Builder::new()
         .name("attach-stdin".into())
@@ -108,7 +111,6 @@ pub async fn run_with_banner(banner: &str) -> anyhow::Result<ExitReason> {
             let mut stdin = stdin.lock();
             let mut buf = [0u8; 1024];
             let mut saw_prefix = false; // Ctrl+B prefix state
-            let mut stop_tx = Some(stop_tx);
 
             loop {
                 match stdin.read(&mut buf) {
@@ -131,7 +133,7 @@ pub async fn run_with_banner(banner: &str) -> anyhow::Result<ExitReason> {
                                         )
                                         .await;
                                     });
-                                    let _ = detach_tx.send(());
+                                    let _ = signal_tx.send(StdinSignal::Detach);
                                     return;
                                 }
                                 if byte == b'q' || byte == b'Q' {
@@ -145,9 +147,7 @@ pub async fn run_with_banner(banner: &str) -> anyhow::Result<ExitReason> {
                                         )
                                         .await;
                                     });
-                                    if let Some(tx) = stop_tx.take() {
-                                        let _ = tx.send(());
-                                    }
+                                    let _ = signal_tx.send(StdinSignal::Stop);
                                     return;
                                 }
                                 // Not a recognized sequence — send the Ctrl+B and this byte
@@ -227,8 +227,7 @@ pub async fn run_with_banner(banner: &str) -> anyhow::Result<ExitReason> {
         }
     });
 
-    // Wait for either: output task ends, detach signal, or stop signal
-    let mut stop_rx = stop_rx;
+    // Wait for either: output task ends or stdin signal (detach/stop)
     let reason = tokio::select! {
         result = output_task => {
             match result {
@@ -248,16 +247,24 @@ pub async fn run_with_banner(banner: &str) -> anyhow::Result<ExitReason> {
                 }
             }
         }
-        _ = &mut detach_rx => {
+        result = signal_rx => {
             let _ = crossterm::terminal::disable_raw_mode();
-            eprintln!("\nDetached from session. (Ctrl+B d)");
-            eprintln!("Session is still running. Reattach with: b3 attach");
-            ExitReason::Detached
-        }
-        _ = &mut stop_rx => {
-            let _ = crossterm::terminal::disable_raw_mode();
-            eprintln!("\nStopping daemon... (Ctrl+B q)");
-            ExitReason::Stopped
+            match result {
+                Ok(StdinSignal::Detach) => {
+                    eprintln!("\nDetached from session. (Ctrl+B d)");
+                    eprintln!("Session is still running. Reattach with: b3 attach");
+                    ExitReason::Detached
+                }
+                Ok(StdinSignal::Stop) => {
+                    eprintln!("\nStopping daemon... (Ctrl+B q)");
+                    ExitReason::Stopped
+                }
+                Err(_) => {
+                    // Stdin thread exited without sending — shouldn't happen in normal flow
+                    eprintln!("\nAttach session ended unexpectedly.");
+                    ExitReason::Disconnected
+                }
+            }
         }
     };
 

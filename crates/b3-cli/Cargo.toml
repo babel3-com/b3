@@ -27,10 +27,6 @@ b3-webrtc = { path = "../b3-webrtc", optional = true }
 # PTY management
 portable-pty = "0.8"
 
-# WireGuard mesh
-boringtun = "0.7"
-smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
-
 # Networking
 reqwest = { workspace = true }
 tokio = { workspace = true }

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "b3": {
+      "command": "b3",
+      "args": ["mcp", "serve"]
+    }
+  }
+}

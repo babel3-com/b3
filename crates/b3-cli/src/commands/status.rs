@@ -1,6 +1,6 @@
-//! b3 status — Show agent identity, mesh state, daemon state, connectivity.
+//! b3 status — Show agent identity, daemon state, connectivity.
 
-use crate::config::{Config, mesh_proxy_port};
+use crate::config::Config;
 use crate::daemon::server;
 
 pub async fn run() -> anyhow::Result<()> {
@@ -17,14 +17,7 @@ pub async fn run() -> anyhow::Result<()> {
     println!("Agent Identity");
     println!("  Email:     {}", config.agent_email);
     println!("  ID:        {}", config.agent_id);
-    println!("  Mesh IP:   {}", config.wg_address);
     println!("  Dashboard: {}", config.web_url);
-    println!();
-
-    // Mesh config
-    println!("Mesh Configuration");
-    println!("  Relay:     {}", config.relay_endpoint);
-    println!("  Proxy:     127.0.0.1:{}", mesh_proxy_port());
     println!();
 
     // Daemon state
@@ -36,8 +29,8 @@ pub async fn run() -> anyhow::Result<()> {
             println!("  PID:       {}", contents.trim());
         }
         // Development mode indicator
-        if let Ok(dir) = std::env::var("B3_BROWSER_DIR") {
-            println!("  Browser:   development ({})", dir);
+        if let Some(dir) = crate::daemon::fork_state::browser_dir() {
+            println!("  Browser:   development ({})", dir.display());
         } else {
             println!("  Browser:   official");
         }
@@ -61,17 +54,6 @@ pub async fn run() -> anyhow::Result<()> {
         }
         Err(e) => {
             println!("  Public API:  ✗ unreachable ({})", e);
-        }
-    }
-
-    // Mesh API (through tunnel, if running)
-    let mesh_url = format!("http://127.0.0.1:{}/health", mesh_proxy_port());
-    match client.get(&mesh_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            println!("  Mesh tunnel: ✓ connected");
-        }
-        _ => {
-            println!("  Mesh tunnel: ✗ not connected (run `b3 start`)");
         }
     }
 

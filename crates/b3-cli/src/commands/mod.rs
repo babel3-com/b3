@@ -9,3 +9,4 @@ pub mod uninstall;
 pub mod version;
 pub mod update;
 pub mod set_password;
+pub mod child;

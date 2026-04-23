@@ -253,12 +253,32 @@
                                 delete self._pendingHttpRequests[frame.id];
                                 clearTimeout(pending.timer);
                                 var status = frame.status || 200;
-                                var bodyText = frame.body || '';
+                                var bodyRaw = frame.body || '';
                                 var contentType = frame.content_type || '';
-                                // Binary responses (audio/*, image/*) are base64-encoded by the daemon.
-                                var isBinary = contentType.indexOf('audio/') === 0 ||
+                                // body_encoding: "base64" is the authoritative signal (new daemons).
+                                // Fall back to content-type sniff for old daemons during rollout.
+                                var isBase64 = frame.body_encoding === 'base64' ||
+                                    contentType.indexOf('audio/') === 0 ||
                                     contentType.indexOf('image/') === 0 ||
                                     contentType === 'application/octet-stream';
+                                var bodyText = isBase64 ? (function() {
+                                    try {
+                                        return new TextDecoder().decode((function() {
+                                            var bin = atob(bodyRaw);
+                                            var bytes = new Uint8Array(bin.length);
+                                            for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                                            return bytes;
+                                        })());
+                                    } catch(_) { return bodyRaw; }
+                                })() : bodyRaw;
+                                var bodyBytes = isBase64 ? (function() {
+                                    try {
+                                        var bin = atob(bodyRaw);
+                                        var bytes = new Uint8Array(bin.length);
+                                        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                                        return bytes;
+                                    } catch(_) { return new Uint8Array(0); }
+                                })() : null;
                                 pending.resolve({
                                     ok: status >= 200 && status < 300,
                                     status: status,
@@ -269,15 +289,7 @@
                                     },
                                     text: function() { return Promise.resolve(bodyText); },
                                     arrayBuffer: function() {
-                                        if (isBinary) {
-                                            try {
-                                                var bin = atob(bodyText);
-                                                var bytes = new Uint8Array(bin.length);
-                                                for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                                                return Promise.resolve(bytes.buffer);
-                                            } catch(_) { return Promise.resolve(new ArrayBuffer(0)); }
-                                        }
-                                        // Text body — encode as UTF-8 bytes
+                                        if (bodyBytes) return Promise.resolve(bodyBytes.buffer);
                                         return Promise.resolve(new TextEncoder().encode(bodyText).buffer);
                                     },
                                     blob: function() {

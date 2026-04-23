@@ -151,6 +151,9 @@ HC.refreshStatusBar = function() {
     if (HC.fullStatus) HC.setTerminalStatus(HC.fullStatus(), true);
 };
 
+// ── Everything below reads HC.config — wait for HC.ready ──
+HC.ready.then(function() {
+
 // ── Agent Settings persistence (EC2 as source of truth) ──
 var sttSelect = document.getElementById('stt-preset');
 var diarizeCheckbox = document.getElementById('stt-diarize');
@@ -233,6 +236,11 @@ window.onDrawerOpen = function() {
     }).catch(function() {});
     // Sync layout toggles from cookie-based prefs (EC2 fetch removed — layout.js owns state)
     if (HC.syncLayoutToggles && HC._prefs) HC.syncLayoutToggles(HC._prefs);
+    // Reuse the boot-time catalog promise (already resolved) — no second fetch
+    var _drawerCatalogLoad = HC._catalogLoadPromise || Promise.resolve([]);
+    _drawerCatalogLoad.finally(function() {
+        if (HC.renderTermKeyPicker) HC.renderTermKeyPicker();
+    });
 };
 
 // ── Drawer (shared) ──
@@ -486,3 +494,14 @@ setTimeout(function() { HC.fitTerminal(); }, 300);
 try { if (HC.ensureSession) HC.ensureSession(); } catch(e) { console.error('[BOOT] ensureSession error:', e); }
 try { loadVoices(); } catch(e) { console.error('[BOOT] loadVoices error:', e); }
 try { resolveAndConnect(); } catch(e) { console.error('[BOOT] resolveAndConnect error:', e); }
+// Load user catalog once — shared by term-keys row render and drawer picker.
+// Stored on HC so onDrawerOpen can chain off it without a second fetch.
+try {
+    HC._catalogLoadPromise = HC.loadUserCatalog ? HC.loadUserCatalog() : Promise.resolve([]);
+    HC._catalogLoadPromise.finally(function() {
+        var _tk = HC._prefs && HC._prefs.term_keys;
+        if (_tk && HC.applyTermKeys) HC.applyTermKeys(_tk);
+    });
+} catch(e) { console.error('[BOOT] applyTermKeys error:', e); }
+
+}); // HC.ready.then

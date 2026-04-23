@@ -1,13 +1,13 @@
-//! Daemon server: owns PTY, tunnel, bridge. Accepts client connections via Unix socket.
+//! Daemon server: owns PTY, bridge. Accepts client connections via Unix socket.
 //!
 //! Lifecycle:
-//!   1. Start tunnel → verify API reachable
+//!   1. Verify API reachable
 //!   2. Spawn Claude Code in PTY
 //!   3. Start puller task (EC2 → daemon: injections, hive, resize)
 //!   4. Listen on Unix socket for attach/detach/stop
 //!   5. On client attach: forward PTY output to client, client input to PTY
 //!   6. On client detach or disconnect: PTY keeps running
-//!   7. On stop: kill PTY, close tunnel, clean up, exit
+//!   7. On stop: kill PTY, clean up, exit
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -19,7 +19,6 @@ use crate::daemon::ipc::{IpcListener, IpcStream};
 use crate::config::Config;
 use crate::daemon::protocol::{self, Message};
 use crate::daemon::web::{self, WebState, SessionStore, EventChannel};
-use crate::mesh::{start_tunnel, WgConfig};
 use crate::pty::manager::PtyManager;
 use crate::bridge::puller;
 use b3_common::AgentEvent;
@@ -39,6 +38,10 @@ struct DaemonState {
     /// if no task is currently awaiting .notified() (race between select! branches).
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// Startup banner bytes — sent to each IPC client right after Welcome.
+    /// Cached here because the broadcast channel drops messages sent before
+    /// any subscriber; IPC clients connect after inject_output() fires.
+    banner: Vec<u8>,
 }
 
 /// Path for the daemon PID file.
@@ -181,31 +184,15 @@ pub async fn run_daemon(
         }
     }
 
-    // 1. Build WireGuard config and start tunnel
-    let wg_config = WgConfig::from_config(&config)?;
-
     if foreground {
         println!("Starting Babel3 v{}...", current_version);
         println!("  Agent:    {} ({})", config.agent_email, config.agent_id);
-        println!("  Mesh IP:  {}", config.wg_address);
-        println!("  Relay:    {}", config.relay_endpoint);
-        if let Ok(dir) = std::env::var("B3_BROWSER_DIR") {
-            println!("  Browser:  DEVELOPMENT ({})", dir);
+        if let Some(dir) = crate::daemon::fork_state::browser_dir() {
+            println!("  Browser:  DEVELOPMENT ({})", dir.display());
         }
     }
 
-    let tunnel = start_tunnel(wg_config).await?;
-
-    // Write actual proxy port so other code (credit checks, etc.) can find it
-    // even when we fell back to a random port.
-    let proxy_port_file = Config::config_dir().join("mesh-proxy.port");
-    let _ = std::fs::write(&proxy_port_file, tunnel.local_addr.port().to_string());
-
-    if foreground {
-        println!("  Proxy:    {}", tunnel.local_addr);
-    }
-
-    // 2. Verify API reachable (direct HTTPS — mesh bypass for v1)
+    // 1. Verify API reachable
     let api_health_url = format!("{}/health", config.api_url);
     let client = crate::http::build_client(std::time::Duration::from_secs(10))?;
 
@@ -227,12 +214,11 @@ pub async fn run_daemon(
     }
 
     if !connected {
-        tunnel.shutdown().await;
         anyhow::bail!("Cannot reach API server at {}", config.api_url);
     }
 
     if foreground {
-        println!("  ✓ API server reachable through mesh");
+        println!("  ✓ API server reachable");
     }
 
     // 2b. Refresh config fields from server — detects post-rename config drift
@@ -303,105 +289,10 @@ pub async fn run_daemon(
         }
     }
 
-    // 3. Ensure Babel3 MCP is registered before spawning Claude Code
-    //    If the B3 plugin is installed, it provides the MCP via its .mcp.json,
-    //    so we skip auto-registration to avoid conflicts. Otherwise, fall back
-    //    to the legacy behavior of writing to .mcp.json directly.
-    //    NON-DESTRUCTIVE: reads existing .mcp.json and only adds the b3 entry.
-    //    Never overwrites or destroys existing MCP configurations.
+    // 3. Ensure CLAUDE.md has voice instructions (up-to-date)
+    //    .mcp.json registration is handled by start.rs self-heal (register_voice_mcp)
+    //    which runs moments before the daemon spawns — no need to duplicate it here.
     {
-        let b3_bin = std::env::current_exe()
-            .unwrap_or_else(|_| std::path::PathBuf::from("b3"));
-
-        // Check if the B3 plugin is installed — if so, it handles MCP registration
-        // via its own .mcp.json, and we skip writing to the project's .mcp.json.
-        //
-        // COUPLING NOTE: This reads Claude Code's internal installed_plugins.json
-        // file, looking for a key starting with "b3@". This is an undocumented
-        // implementation detail of Claude Code's plugin system. If Anthropic changes
-        // the format or location, this detection will fail silently and the daemon
-        // will fall back to legacy .mcp.json registration (which is safe — it just
-        // means a duplicate MCP entry that Claude Code deduplicates anyway).
-        //
-        // TODO: Replace with a proper plugin detection mechanism if Claude Code
-        // provides one (e.g., `claude plugin check b3` CLI command).
-        let b3_plugin_installed = dirs::home_dir()
-            .map(|home| home.join(".claude/plugins/installed_plugins.json"))
-            .and_then(|path| std::fs::read_to_string(&path).ok())
-            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
-            .and_then(|json| json.get("plugins")?.as_object().cloned())
-            .map(|plugins| plugins.keys().any(|k| k.starts_with("b3@")))
-            .unwrap_or(false);
-
-        if b3_plugin_installed {
-            tracing::info!("B3 plugin detected — MCP provided by plugin, skipping .mcp.json auto-registration");
-            if foreground {
-                eprintln!("  ✓ B3 plugin provides MCP — skipping .mcp.json registration");
-            }
-        } else {
-            // Legacy fallback: register MCP in .mcp.json directly
-            let mcp_path = std::env::current_dir()
-                .unwrap_or_default()
-                .join(".mcp.json");
-
-            let mut mcp_config: Option<serde_json::Value> = None;
-
-            if mcp_path.exists() {
-                match std::fs::read_to_string(&mcp_path) {
-                    Ok(data) => match serde_json::from_str::<serde_json::Value>(&data) {
-                        Ok(parsed) => {
-                            // Backup the original before we touch it (first time only)
-                            let backup_path = mcp_path.with_extension("json.b3-backup");
-                            if !backup_path.exists() {
-                                let _ = std::fs::copy(&mcp_path, &backup_path);
-                            }
-                            mcp_config = Some(parsed);
-                        }
-                        Err(e) => {
-                            // Existing file is not valid JSON — DO NOT overwrite it.
-                            tracing::warn!("Cannot parse existing .mcp.json: {e}. Leaving it untouched.");
-                            if foreground {
-                                eprintln!("  ⚠ Warning: .mcp.json exists but is not valid JSON.");
-                                eprintln!("    Voice MCP not auto-registered. Add manually:");
-                                eprintln!("    \"b3\": {{ \"command\": \"{}\", \"args\": [\"mcp\", \"voice\"] }}",
-                                    b3_bin.to_string_lossy());
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!("Cannot read .mcp.json: {e}");
-                    }
-                }
-            } else {
-                // No existing file — safe to create fresh
-                mcp_config = Some(serde_json::json!({ "mcpServers": {} }));
-            }
-
-            if let Some(ref mut config) = mcp_config {
-                if config.get("mcpServers").is_none() {
-                    config["mcpServers"] = serde_json::json!({});
-                }
-                // Merge into existing b3 entry to preserve user-added fields (e.g. env)
-                let b3_entry = config["mcpServers"]
-                    .get("b3")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let mut entry = if b3_entry.is_object() {
-                    b3_entry
-                } else {
-                    serde_json::json!({})
-                };
-                entry["command"] = serde_json::Value::String(b3_bin.to_string_lossy().into_owned());
-                entry["args"] = serde_json::json!(["mcp", "voice"]);
-                entry["_b3_version"] = serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string());
-                config["mcpServers"]["b3"] = entry;
-
-                if let Ok(json_str) = serde_json::to_string_pretty(config) {
-                    let _ = std::fs::write(&mcp_path, json_str);
-                }
-            }
-        }
-
         // Also ensure CLAUDE.md has voice instructions (up-to-date)
         let claude_md_path = std::env::current_dir()
             .unwrap_or_default()
@@ -695,12 +586,21 @@ pub async fn run_daemon(
                 .join(".b3/info-archive")
         )),
         daemon_password_hash: crate::config::Config::load_daemon_password_hash(),
-        browser_dir: std::env::var("B3_BROWSER_DIR").ok().map(|d| {
-            let path = std::path::PathBuf::from(&d);
+        browser_dir: crate::daemon::fork_state::browser_dir().map(|p| {
             // Canonicalize to resolve symlinks and ../ — limits what ServeDir will serve.
             // Dev-only feature behind explicit --browser-dir flag, but be defensive.
-            std::fs::canonicalize(&path).unwrap_or(path)
+            std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())
         }),
+        app_port: {
+            let val = crate::daemon::fork_state::app_port();
+            tracing::info!(app_port = ?val, "[Daemon] app proxy config");
+            val
+        },
+        app_public: {
+            let val = crate::daemon::fork_state::app_public();
+            tracing::info!(app_public = val, "[Daemon] app proxy config");
+            val
+        },
         force_lowercase: std::sync::Arc::new(tokio::sync::RwLock::new(true)),
         session_manager: Arc::new(b3_reliable::SessionManager::new()),
         counters: std::sync::Arc::new(crate::daemon::web::PipelineCounters::default()),
@@ -784,6 +684,14 @@ pub async fn run_daemon(
         web_state.clone(),
         local_pusher_rx_early,
     );
+
+    // Inject startup banner into the PTY output broadcast so browser terminals
+    // see it in the session buffer alongside the local terminal.
+    // Single source of truth: crate::commands::start::startup_banner() owns the text.
+    // Also cache in DaemonState so handle_client can replay it to IPC clients that
+    // connect after this broadcast fires (broadcast drops messages with no subscribers).
+    let banner_bytes = crate::commands::start::startup_banner(&config).into_bytes();
+    pty.inject_output(banner_bytes.clone());
 
     // Local puller: WebSocket keystrokes → PTY stdin
     let web_events = web_state.events.clone();
@@ -1027,8 +935,6 @@ pub async fn run_daemon(
         }
     }
 
-    let tunnel_handle = tokio::spawn(async move { /* tunnel removed */ });
-
     // Build shared state
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = Arc::new(DaemonState {
@@ -1039,6 +945,7 @@ pub async fn run_daemon(
         cols: Mutex::new(cols),
         shutdown_tx,
         shutdown_rx,
+        banner: banner_bytes,
     });
 
     // 5. Listen for IPC connections (Unix socket on Unix, TCP localhost on Windows)
@@ -1128,15 +1035,19 @@ pub async fn run_daemon(
     local_pusher_handle.abort();
     local_puller_handle.abort();
     web_handle.abort();
-    tunnel_handle.abort();
     {
         let mut pty = state.pty.lock().await;
         let _ = pty.kill();
     }
-    let _ = tokio::time::timeout_at(shutdown_deadline, tunnel.shutdown()).await;
 
     if foreground {
         println!("Done.");
+    }
+
+    // Deregister boot service — Ctrl+B q and b3 stop are equivalent.
+    // After a clean shutdown the daemon should not auto-restart on next boot.
+    if let Err(e) = crate::service::uninstall() {
+        tracing::debug!("service::uninstall on shutdown: {e}");
     }
 
     // Force-exit: libdatachannel C++ threads may still be running teardown.
@@ -1163,6 +1074,16 @@ async fn handle_client(stream: IpcStream, state: Arc<DaemonState>) -> anyhow::Re
         &Message::Welcome { rows, cols },
     )
     .await?;
+
+    // Replay startup banner — the broadcast fired before this client subscribed,
+    // so it was dropped. Send it directly as the first Output frame.
+    if !state.banner.is_empty() {
+        protocol::write_message(
+            &mut writer,
+            &Message::Output(state.banner.clone()),
+        )
+        .await?;
+    }
 
     // Subscribe to PTY output
     let mut output_rx = state.output_tx.subscribe();

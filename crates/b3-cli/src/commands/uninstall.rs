@@ -77,6 +77,13 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // 2b. Remove service registration
+    if let Err(e) = crate::service::uninstall() {
+        println!("  Note: Could not remove service registration: {e}");
+    } else {
+        println!("  ✓ Service registration removed");
+    }
+
     // 3. Remove config directory
     let config_dir = Config::config_dir();
     if config_dir.exists() {
@@ -100,9 +107,9 @@ pub async fn run() -> anyhow::Result<()> {
             let mut choice = String::new();
             io::stdin().read_line(&mut choice)?;
             if choice.trim().eq_ignore_ascii_case("s") {
-                // Surgical: remove just b3-voice, keep backup around
+                // Surgical: remove just the b3 entry, keep backup around
                 remove_mcp_entry(&mcp_path)?;
-                println!("  ✓ Removed b3-voice from .mcp.json (backup kept at .mcp.json.b3-backup)");
+                println!("  ✓ Removed b3 from .mcp.json (backup kept at .mcp.json.b3-backup)");
             } else {
                 // Restore: replace with exact original
                 std::fs::copy(&mcp_backup, &mcp_path)?;
@@ -112,7 +119,7 @@ pub async fn run() -> anyhow::Result<()> {
         } else {
             // No backup — surgical removal only option
             if remove_mcp_entry(&mcp_path)? {
-                println!("  ✓ Removed b3-voice from .mcp.json");
+                println!("  ✓ Removed b3 from .mcp.json");
             }
         }
     }
@@ -163,7 +170,7 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Surgically remove just the b3-voice entry from .mcp.json.
+/// Surgically remove just the b3 entry from .mcp.json.
 /// Returns true if an entry was removed.
 fn remove_mcp_entry(mcp_path: &std::path::Path) -> anyhow::Result<bool> {
     let data = std::fs::read_to_string(mcp_path)?;
