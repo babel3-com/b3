@@ -19,6 +19,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -1772,6 +1773,416 @@ fn make_error_response(id: Value, code: i32, message: &str) -> JsonRpcResponse {
 // Channel notification delivery
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelDelivery {
+    ClaudeChannels,
+    CodexAppServer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexTurnInjection {
+    Start,
+    Steer(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexThreadSnapshot {
+    thread_id: String,
+    status: String,
+    active_turn_id: Option<String>,
+}
+
+fn channel_delivery() -> ChannelDelivery {
+    let explicit_target = std::env::var("B3_CHANNEL_TARGET")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let codex_enabled = std::env::var("B3_CODEX_APP_SERVER")
+        .map(|value| matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "codex"
+        ))
+        .unwrap_or(false);
+
+    if explicit_target == "codex" || codex_enabled {
+        ChannelDelivery::CodexAppServer
+    } else {
+        ChannelDelivery::ClaudeChannels
+    }
+}
+
+fn codex_status_type(status: &Value) -> Option<&str> {
+    status.get("type").and_then(Value::as_str).or_else(|| status.as_str())
+}
+
+fn codex_turn_injection(snapshot: &CodexThreadSnapshot) -> CodexTurnInjection {
+    if snapshot.status == "active" {
+        if let Some(turn_id) = snapshot.active_turn_id.as_ref() {
+            return CodexTurnInjection::Steer(turn_id.clone());
+        }
+    }
+    CodexTurnInjection::Start
+}
+
+fn codex_text_input(text: &str) -> Value {
+    json!([{ "type": "text", "text": text }])
+}
+
+fn codex_turn_start_params(thread_id: &str, text: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "input": codex_text_input(text),
+    })
+}
+
+fn codex_turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": codex_text_input(text),
+    })
+}
+
+struct CodexAppServerClient {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: io::BufReader<ChildStdout>,
+    next_id: i64,
+    cached_thread_id: Option<String>,
+    last_snapshot: Option<CodexThreadSnapshot>,
+}
+
+impl CodexAppServerClient {
+    fn connect() -> anyhow::Result<Self> {
+        let program = std::env::var("B3_CODEX_APP_SERVER_COMMAND")
+            .unwrap_or_else(|_| "codex".to_string());
+        let args = std::env::var("B3_CODEX_APP_SERVER_ARGS")
+            .map(|raw| raw.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_else(|_| vec!["app-server".to_string(), "proxy".to_string()]);
+
+        let mut child = Command::new(&program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("codex app-server proxy stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("codex app-server proxy stdout unavailable"))?;
+
+        let mut client = Self {
+            _child: child,
+            stdin,
+            stdout: io::BufReader::new(stdout),
+            next_id: 1,
+            cached_thread_id: std::env::var("B3_CODEX_THREAD_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            last_snapshot: None,
+        };
+
+        client.initialize()?;
+        Ok(client)
+    }
+
+    fn initialize(&mut self) -> anyhow::Result<()> {
+        let _ = self.request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "b3_codex_bridge",
+                    "title": "Babel3 Codex Bridge",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                },
+            }),
+        )?;
+        self.write_json(json!({ "method": "initialized" }))?;
+        Ok(())
+    }
+
+    fn submit_transcription(&mut self, text: &str) -> anyhow::Result<()> {
+        let snapshot = self.current_thread_snapshot()?;
+        let injection = codex_turn_injection(&snapshot);
+        let method = match injection {
+            CodexTurnInjection::Start => {
+                let result = self.request(
+                    "turn/start",
+                    codex_turn_start_params(&snapshot.thread_id, text),
+                )?;
+                if let Some(turn_id) = result
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    self.last_snapshot = Some(CodexThreadSnapshot {
+                        thread_id: snapshot.thread_id.clone(),
+                        status: "active".to_string(),
+                        active_turn_id: Some(turn_id.to_string()),
+                    });
+                }
+                "turn/start"
+            }
+            CodexTurnInjection::Steer(turn_id) => {
+                match self.request(
+                    "turn/steer",
+                    codex_turn_steer_params(&snapshot.thread_id, &turn_id, text),
+                ) {
+                    Ok(_) => "turn/steer",
+                    Err(err) => {
+                        eprintln!(
+                            "[b3-mcp] Codex turn/steer failed ({err}); retrying as turn/start"
+                        );
+                        let result = self.request(
+                            "turn/start",
+                            codex_turn_start_params(&snapshot.thread_id, text),
+                        )?;
+                        if let Some(new_turn_id) = result
+                            .get("turn")
+                            .and_then(|turn| turn.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            self.last_snapshot = Some(CodexThreadSnapshot {
+                                thread_id: snapshot.thread_id.clone(),
+                                status: "active".to_string(),
+                                active_turn_id: Some(new_turn_id.to_string()),
+                            });
+                        }
+                        "turn/start"
+                    }
+                }
+            }
+        };
+        eprintln!(
+            "[b3-mcp] Codex channel: transcription delivered via {method} to {}",
+            snapshot.thread_id
+        );
+        Ok(())
+    }
+
+    fn current_thread_snapshot(&mut self) -> anyhow::Result<CodexThreadSnapshot> {
+        let thread_id = match self.cached_thread_id.clone() {
+            Some(thread_id) => thread_id,
+            None => {
+                let thread_id = self.discover_thread_id()?;
+                self.cached_thread_id = Some(thread_id.clone());
+                thread_id
+            }
+        };
+        let snapshot = self.read_thread_snapshot(&thread_id)?;
+        self.last_snapshot = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn discover_thread_id(&mut self) -> anyhow::Result<String> {
+        let result = self.request("thread/loaded/list", json!({}))?;
+        let thread_ids = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("thread/loaded/list response missing data"))?;
+        match thread_ids.len() {
+            0 => anyhow::bail!("no loaded Codex threads; set B3_CODEX_THREAD_ID or resume a thread"),
+            1 => thread_ids[0]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("loaded thread id is not a string")),
+            _ => self.choose_loaded_thread(thread_ids),
+        }
+    }
+
+    fn choose_loaded_thread(&mut self, thread_ids: &[Value]) -> anyhow::Result<String> {
+        let mut candidates = Vec::new();
+        for thread_id in thread_ids.iter().filter_map(Value::as_str) {
+            let result = self.request(
+                "thread/read",
+                json!({ "threadId": thread_id, "includeTurns": false }),
+            )?;
+            let thread = result
+                .get("thread")
+                .ok_or_else(|| anyhow::anyhow!("thread/read response missing thread"))?;
+            let status = codex_status_type(thread.get("status").unwrap_or(&Value::Null))
+                .unwrap_or("unknown")
+                .to_string();
+            let updated_at = thread
+                .get("updatedAt")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            candidates.push((thread_id.to_string(), status, updated_at));
+        }
+
+        let active = candidates
+            .iter()
+            .filter(|(_, status, _)| status == "active")
+            .collect::<Vec<_>>();
+        if active.len() == 1 {
+            return Ok(active[0].0.clone());
+        }
+
+        candidates
+            .into_iter()
+            .max_by_key(|(_, _, updated_at)| *updated_at)
+            .map(|(thread_id, _, _)| {
+                eprintln!(
+                    "[b3-mcp] multiple Codex threads loaded; selected most recently updated {thread_id}. Set B3_CODEX_THREAD_ID to pin this."
+                );
+                thread_id
+            })
+            .ok_or_else(|| anyhow::anyhow!("loaded thread ids were not strings"))
+    }
+
+    fn read_thread_snapshot(&mut self, thread_id: &str) -> anyhow::Result<CodexThreadSnapshot> {
+        let result = self.request(
+            "thread/read",
+            json!({ "threadId": thread_id, "includeTurns": true }),
+        )?;
+        let thread = result
+            .get("thread")
+            .ok_or_else(|| anyhow::anyhow!("thread/read response missing thread"))?;
+        let status = codex_status_type(thread.get("status").unwrap_or(&Value::Null))
+            .unwrap_or("unknown")
+            .to_string();
+        let active_turn_id = thread
+            .get("turns")
+            .and_then(Value::as_array)
+            .and_then(|turns| {
+                turns.iter().rev().find_map(|turn| {
+                    let status = turn.get("status").and_then(Value::as_str)?;
+                    if status == "inProgress" {
+                        turn.get("id").and_then(Value::as_str).map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .or_else(|| {
+                self.last_snapshot.as_ref().and_then(|snapshot| {
+                    if snapshot.thread_id == thread_id && snapshot.status == "active" {
+                        snapshot.active_turn_id.clone()
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        Ok(CodexThreadSnapshot {
+            thread_id: thread_id.to_string(),
+            status,
+            active_turn_id,
+        })
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write_json(json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        }))?;
+        self.read_response(id)
+    }
+
+    fn write_json(&mut self, value: Value) -> anyhow::Result<()> {
+        let line = serde_json::to_string(&value)?;
+        writeln!(self.stdin, "{line}")?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+
+    fn read_response(&mut self, expected_id: i64) -> anyhow::Result<Value> {
+        loop {
+            let mut line = String::new();
+            let n = self.stdout.read_line(&mut line)?;
+            if n == 0 {
+                anyhow::bail!("codex app-server proxy closed");
+            }
+            let value: Value = serde_json::from_str(line.trim())?;
+            if value.get("method").is_some() && value.get("id").is_none() {
+                self.observe_notification(&value);
+                continue;
+            }
+            if value.get("id").and_then(Value::as_i64) != Some(expected_id) {
+                continue;
+            }
+            if let Some(error) = value.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("codex app-server request failed");
+                anyhow::bail!("{message}");
+            }
+            return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
+        }
+    }
+
+    fn observe_notification(&mut self, value: &Value) {
+        match value.get("method").and_then(Value::as_str) {
+            Some("thread/status/changed") => {
+                if let Some(params) = value.get("params") {
+                    let thread_id = params
+                        .get("threadId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let status = codex_status_type(params.get("status").unwrap_or(&Value::Null))
+                        .unwrap_or("unknown");
+                    if !thread_id.is_empty() {
+                        let active_turn_id = self.last_snapshot.as_ref().and_then(|snapshot| {
+                            if snapshot.thread_id == thread_id && status == "active" {
+                                snapshot.active_turn_id.clone()
+                            } else {
+                                None
+                            }
+                        });
+                        self.last_snapshot = Some(CodexThreadSnapshot {
+                            thread_id: thread_id.to_string(),
+                            status: status.to_string(),
+                            active_turn_id,
+                        });
+                    }
+                }
+            }
+            Some("turn/started") => {
+                if let Some(params) = value.get("params") {
+                    if let (Some(thread_id), Some(turn_id)) = (
+                        params.get("threadId").and_then(Value::as_str),
+                        params
+                            .get("turn")
+                            .and_then(|turn| turn.get("id"))
+                            .and_then(Value::as_str),
+                    ) {
+                        self.last_snapshot = Some(CodexThreadSnapshot {
+                            thread_id: thread_id.to_string(),
+                            status: "active".to_string(),
+                            active_turn_id: Some(turn_id.to_string()),
+                        });
+                    }
+                }
+            }
+            Some("turn/completed") => {
+                if let Some(thread_id) = value
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                {
+                    self.last_snapshot = Some(CodexThreadSnapshot {
+                        thread_id: thread_id.to_string(),
+                        status: "idle".to_string(),
+                        active_turn_id: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Write a `notifications/claude/channel` JSON-RPC notification to stdout.
 /// This is a fire-and-forget notification (no `id` field) per the MCP spec.
 fn send_channel_notification(
@@ -1819,6 +2230,10 @@ fn channel_events_watcher(
     let url = format!("http://127.0.0.1:{}/api/channel-events?token={}", port, api_key);
     let mut backoff = std::time::Duration::from_secs(1);
     let max_backoff = std::time::Duration::from_secs(30);
+    let delivery = channel_delivery();
+    let mut codex_client: Option<CodexAppServerClient> = None;
+
+    eprintln!("[b3-mcp] Channel delivery mode: {:?}", delivery);
 
     loop {
         eprintln!("[b3-mcp] Connecting to channel-events SSE at port {}", port);
@@ -1846,14 +2261,42 @@ fn channel_events_watcher(
                                         "transcription" => {
                                             if !text.is_empty() {
                                                 eprintln!("[b3-mcp] Channel: transcription ({} bytes)", text.len());
-                                                send_channel_notification(&stdout, text, "voice", msg_id, "voice");
+                                                match delivery {
+                                                    ChannelDelivery::ClaudeChannels => {
+                                                        send_channel_notification(&stdout, text, "voice", msg_id, "voice");
+                                                    }
+                                                    ChannelDelivery::CodexAppServer => {
+                                                        if codex_client.is_none() {
+                                                            match CodexAppServerClient::connect() {
+                                                                Ok(client) => {
+                                                                    eprintln!("[b3-mcp] Connected to Codex app-server for channel delivery");
+                                                                    codex_client = Some(client);
+                                                                }
+                                                                Err(err) => {
+                                                                    eprintln!("[b3-mcp] Codex app-server connect failed: {err}");
+                                                                }
+                                                            }
+                                                        }
+
+                                                        if let Some(client) = codex_client.as_mut() {
+                                                            if let Err(err) = client.submit_transcription(text) {
+                                                                eprintln!("[b3-mcp] Codex transcription delivery failed: {err}");
+                                                                codex_client = None;
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         "hive_dm" => {
                                             let sender = event.get("sender").and_then(|v| v.as_str()).unwrap_or("unknown");
                                             if !text.is_empty() {
                                                 eprintln!("[b3-mcp] Channel: hive DM from {sender} ({} bytes)", text.len());
-                                                send_channel_notification(&stdout, text, "hive_dm", msg_id, sender);
+                                                if delivery == ChannelDelivery::ClaudeChannels {
+                                                    send_channel_notification(&stdout, text, "hive_dm", msg_id, sender);
+                                                } else {
+                                                    eprintln!("[b3-mcp] Codex app-server delivery currently ignores hive DM events");
+                                                }
                                             }
                                         }
                                         "hive_room" => {
@@ -1862,7 +2305,11 @@ fn channel_events_watcher(
                                             if !text.is_empty() {
                                                 let chat_id = format!("hive_room_{room_id}");
                                                 eprintln!("[b3-mcp] Channel: hive room from {sender} in {room_id} ({} bytes)", text.len());
-                                                send_channel_notification(&stdout, text, &chat_id, msg_id, sender);
+                                                if delivery == ChannelDelivery::ClaudeChannels {
+                                                    send_channel_notification(&stdout, text, &chat_id, msg_id, sender);
+                                                } else {
+                                                    eprintln!("[b3-mcp] Codex app-server delivery currently ignores hive room events");
+                                                }
                                             }
                                         }
                                         _ => {}
@@ -2240,6 +2687,55 @@ mod tests {
         let id = generate_msg_id();
         assert_eq!(id.len(), 8);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_codex_status_type_accepts_tagged_and_string_statuses() {
+        assert_eq!(codex_status_type(&json!({"type": "idle"})), Some("idle"));
+        assert_eq!(codex_status_type(&json!("active")), Some("active"));
+        assert_eq!(codex_status_type(&json!({})), None);
+    }
+
+    #[test]
+    fn test_codex_turn_injection_starts_when_idle() {
+        let snapshot = CodexThreadSnapshot {
+            thread_id: "thr_1".to_string(),
+            status: "idle".to_string(),
+            active_turn_id: None,
+        };
+        assert_eq!(codex_turn_injection(&snapshot), CodexTurnInjection::Start);
+    }
+
+    #[test]
+    fn test_codex_turn_injection_steers_active_turn() {
+        let snapshot = CodexThreadSnapshot {
+            thread_id: "thr_1".to_string(),
+            status: "active".to_string(),
+            active_turn_id: Some("turn_1".to_string()),
+        };
+        assert_eq!(
+            codex_turn_injection(&snapshot),
+            CodexTurnInjection::Steer("turn_1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_codex_turn_params_match_app_server_field_names() {
+        assert_eq!(
+            codex_turn_start_params("thr_1", "hello"),
+            json!({
+                "threadId": "thr_1",
+                "input": [{ "type": "text", "text": "hello" }]
+            })
+        );
+        assert_eq!(
+            codex_turn_steer_params("thr_1", "turn_1", "hello"),
+            json!({
+                "threadId": "thr_1",
+                "expectedTurnId": "turn_1",
+                "input": [{ "type": "text", "text": "hello" }]
+            })
+        );
     }
 
     #[test]
